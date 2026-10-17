@@ -1751,10 +1751,11 @@ static void usi_emit_checkmate(void){
   fflush(stdout);
 }
 
+static double g_usi_tlimit=1e9;
 static void* usi_solver(void*arg){
   (void)arg;
   Pos p=g_usi_pos;
-  long nodes; double tl=1e9;
+  long nodes; double tl=g_usi_tlimit;
   long nl=1000000000L;
   g_usi_result.result=solve(&p,nl,tl,&nodes);
   g_usi_result.nodes=nodes;
@@ -1838,6 +1839,12 @@ static void usi_loop(void){
     if(!strncmp(line,"go",2)){
       if(!g_usi_has_pos){ printf("bestmove resign\n"); fflush(stdout); continue; }
       g_usi_gomate=!!strstr(line,"mate");
+      /* `go mate <ms>`: answer within <ms> (USI). `go mate infinite` / no number: until stop.
+       * Earlier the limit was ignored (tl=1e9), so a caller that trusted the protocol and waited
+       * for the answer instead of sending stop blocked until the proof finished. */
+      g_usi_tlimit=1e9;
+      if(g_usi_gomate){ const char*mp=strstr(line,"mate")+4; while(*mp==' ')mp++;
+        if(*mp>='0'&&*mp<='9'){ double ms=atof(mp); if(ms>0) g_usi_tlimit=ms/1000.0; } }
       g_stop=0; g_usi_searching=1; g_usi_done=0;
       usp=0; g_pathlen=0;
       pthread_create(&g_usi_thread,NULL,usi_solver,NULL);
