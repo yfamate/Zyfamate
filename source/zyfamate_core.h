@@ -1590,10 +1590,38 @@ static int parse_csa(Pos*p,const char*text){
   refresh_kings(p); p->key=compute_key(p); p->bkey=compute_bkey(p); ykey_refresh(p); return 1; }
 /* 直前の solve() が証明した詰みの初手を置換表から即答で引く (手数測定より遥かに軽い)。
  * 手数測定が予算切れでも初手だけは返せるようにする最終フォールバック。 */
+/* ---- [ROOT-HISTORY 2026-10-17] 対局履歴を踏まえた連続王手の千日手の除外 ----
+ * 探索木は履歴を持たない (g_pathlen=0 から) ので、証明そのものは履歴非依存。ところが実戦で指す初手は
+ * 対局履歴と合わせて「同一局面 4 回 + その間の攻め方の手が全て王手」(連続王手の千日手 = 王手側の反則負け)
+ * を成立させ得る。Pyfamate はこれを呼び出し側 (_mate_move_accepted) で検問していたが、Cyfamate は検問なしに
+ * Zyfamate の初手を採るため、検問をここ (初手選択) へ移す。
+ * 履歴: g_rh_key[0..n] = 開局〜根の局面鍵 (compute_key)、g_rh_chk[k] = k+1 手目が王手だったか。
+ * USI では position ... moves から記録する。組込み先は zyf_set_root_history() で渡す (渡さなければ従来どおり)。 */
+#define ZYF_RH_MAX 2048
+static uint64_t g_rh_key[ZYF_RH_MAX+1]; static unsigned char g_rh_chk[ZYF_RH_MAX]; static int g_rh_n=-1;
+static void zyf_set_root_history(const uint64_t*keys,const unsigned char*checks,int nmoves){
+  if(!keys||nmoves<0||nmoves>ZYF_RH_MAX){ g_rh_n=-1; return; }
+  for(int i=0;i<=nmoves;i++) g_rh_key[i]=keys[i];
+  for(int i=0;i<nmoves;i++) g_rh_chk[i]=checks?checks[i]:0;
+  g_rh_n=nmoves; }
+static void zyf_clear_root_history(void){ g_rh_n=-1; }
+/* 根 p (履歴の最終局面と一致すること) で攻め方が mv を指すと連続王手の千日手になるか。 */
+static int root_move_perpetual(Pos*p,int mv){
+  if(g_rh_n<0 || g_rh_key[g_rh_n]!=p->key) return 0;
+  make_move(p,mv); const uint64_t k=p->key; const int chk=in_check(p,p->side); unmake_move(p);
+  if(!chk) return 0;
+  int occ=1, i0=g_rh_n+1;
+  for(int i=0;i<=g_rh_n;i++) if(g_rh_key[i]==k){ occ++; if(i<i0) i0=i; }
+  if(occ<4) return 0;
+  /* 区間 i0..(新局面) の手 = 手番号 i0..g_rh_n (g_rh_n は mv)。攻め方の手は mv と同じ偶奇。 */
+  for(int j=i0;j<g_rh_n;j++) if(((g_rh_n-j)&1)==0 && !g_rh_chk[j]) return 0;
+  return 1; }
+
 static int first_mate_move(Pos*p,int honor_stop=0){
   if(honor_stop && g_stop) return -1;
   int mv[MAXMOVES]; int n=gen_checks(p,mv); int first=-1;
-  for(int i=0;i<n;i++){ if(honor_stop && g_stop) return -1; int pn,dn; make_move(p,mv[i]); tt_read(p->key,&pn,&dn);
+  for(int i=0;i<n;i++){ if(honor_stop && g_stop) return -1; if(root_move_perpetual(p,mv[i])) continue;
+    int pn,dn; make_move(p,mv[i]); tt_read(p->key,&pn,&dn);
     /* A check that leaves no legal reply is mate in 1 (gen_checks already drops pawn-drop mates), so prefer it to
      * the first proven child in generation order, which may be a long mate. */
     int reply[MAXMOVES]; const int mated=gen_legal(p,reply)==0; unmake_move(p);
@@ -1740,6 +1768,10 @@ static void usi_emit_checkmate(void){
     int L=g_usi_result.mate_len;
     if(L>0){ char pv[8192]; Pos q=g_usi_pos; g_attacker=q.side;
       print_pv_usi(&q,L,pv,5.0);
+      /* [ROOT-HISTORY] PV 生成は履歴を見ないので、初手が連続王手の千日手で除外された手と違うなら
+       * PV ではなく採用初手だけを返す (呼び出し側が指すのは初手)。 */
+      char fmb[8]; move_usi(g_usi_result.bestmove,fmb); size_t fl=strlen(fmb);
+      if(pv[0] && (strncmp(pv,fmb,fl)!=0 || (pv[fl]!=' ' && pv[fl]!=0))) strcpy(pv,fmb);
       if(pv[0]) printf("checkmate %s\n",pv);
       else { char mb[8]; move_usi(g_usi_result.bestmove,mb); printf("checkmate %s\n",mb); }
     } else { char mb[8]; move_usi(g_usi_result.bestmove,mb); printf("checkmate %s\n",mb); }
@@ -1819,6 +1851,9 @@ static void usi_loop(void){
         if(!parse_sfen(&g_usi_pos,sfen_buf)){ g_usi_has_pos=0; continue; }
         while(*s==' ')s++;
       }
+      /* [ROOT-HISTORY] 開局からの局面鍵と各手の王手を記録 (連続王手の千日手を初手から除くため)。 */
+      static uint64_t rh_k[ZYF_RH_MAX+1]; static unsigned char rh_c[ZYF_RH_MAX]; int rh_n=0, rh_ok=1;
+      g_usi_pos.key=compute_key(&g_usi_pos); rh_k[0]=g_usi_pos.key;
       if(!strncmp(s,"moves",5)){
         s+=5; while(*s==' ')s++;
         char tok[16]; int ti;
@@ -1827,12 +1862,15 @@ static void usi_loop(void){
           while(*s==' ')s++;
           if(!ti)continue;
           int m=parse_usi_move(&g_usi_pos,tok);
-          if(m<0)break;
+          if(m<0){ rh_ok=0; break; }
           make_move(&g_usi_pos,m);
           g_usi_pos.key=compute_key(&g_usi_pos);
           g_usi_pos.bkey=compute_bkey(&g_usi_pos); ykey_refresh(&g_usi_pos);
+          if(rh_n<ZYF_RH_MAX){ rh_c[rh_n]=(unsigned char)in_check(&g_usi_pos,g_usi_pos.side); rh_k[++rh_n]=g_usi_pos.key; }
+          else rh_ok=0;
         }
       }
+      if(rh_ok) zyf_set_root_history(rh_k,rh_c,rh_n); else zyf_clear_root_history();
       g_usi_has_pos=1;
       continue; }
 
