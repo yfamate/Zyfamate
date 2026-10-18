@@ -1,9 +1,9 @@
 #pragma once
-// Zyfamate ― 自己完結の df-pn 詰将棋エンジン（盤面・指し手生成・make/unmake・df-pn+・証明駒・USI）。
-// 単独では source/main.cpp から usi_loop() を呼ぶ。Cyfamate はこのファイルを source/zyfamate/ に借りて、
-// 常駐の詰み探索として通常探索と並走させる。マクロは末尾で全て #undef し、SQ は push/pop で隔離する。
-// ZYFAMATE_HOST_YANEURAOU: Cyfamate（やねうら王系）に組み込む時だけ定義する。定義すると、証明木を探索側の
-// 局面鍵（やねうら王の Zobrist）と指し手形式で渡す経路が有効になる。単独版では無効（鍵は 0、渡し先も無い）。
+
+
+
+
+
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -25,9 +25,7 @@
 #include <pthread.h>
 #pragma push_macro("SQ")
 #undef SQ
-/* [ZYF-O3 2026-10-05] The solver alone is built at -O3 under GCC; the engine keeps the build's -O2. On the avx512_vnni
- * bench (tests/zyf_bench.cpp, 332 positions x 100k nodes, -march=native) the same source ran ~176k nps at -O2 and
- * ~223k nps at -O3 with identical results. -mprefer-vector-width=512 added only ~3%. Clang ignores this pragma. */
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
 #pragma GCC optimize("O3")
@@ -39,11 +37,9 @@ static inline _CMul _zmalloc(size_t s){ return {s}; }
 static inline _CCal _zcalloc(size_t n,size_t s){ return {n,s}; }
 #define malloc(s) Zyfamate::_zmalloc(s)
 #define calloc(n,s) Zyfamate::_zcalloc(n,s)
-/* core.c -- 高速詰将棋エンジン(C). 盤面/指し手生成/make-unmake/df-pn+/証明駒.
- * 純Python実装(shogi.py,dfpn.py)を移植・高速化したもの。perftとPython差分で検証。 */
 
-/* 指し手バッファの上限。将棋の合法手最大は593(成/不成別計上込み)。王手/合法手は
- * その部分集合なので1024で安全。デバッグビルド(assert有効)では各生成器の出口で超過を検出。 */
+
+
 #define MAXMOVES 1024
 
 enum { EMPTY=0, PAWN=1,LANCE,KNIGHT,SILVER,GOLD,BISHOP,ROOK,KING,
@@ -55,11 +51,11 @@ static inline int pcolor(int pc){return pc>=WOFF?WHITE:BLACK;}
 static inline int ptype(int pc){return pc>=WOFF?pc-WOFF:pc;}
 static inline int mkpc(int pt,int col){return pt+(col==WHITE?WOFF:0);}
 
-static int PROMO[15];   /* base type -> promoted type (0 if none) */
-static int DEMO[15];    /* any type -> base droppable type */
+static int PROMO[15];   
+static int DEMO[15];    
 static int IS_PROMOTABLE[15];
 
-/* move encoding */
+
 #define MV(from,to,promo,drop) ((from)|((to)<<7)|((promo)<<14)|((drop)<<15))
 #define M_FROM(m) ((m)&0x7F)
 #define M_TO(m)   (((m)>>7)&0x7F)
@@ -68,13 +64,13 @@ static int IS_PROMOTABLE[15];
 #define DROP_FROM 0x7F
 #define IS_DROP(m) (M_FROM(m)==DROP_FROM)
 
-/* geometry */
+
 static inline int SQ(int r,int c){return r*9+c;}
 static inline int RNK(int s){return s/9;}
 static inline int COL(int s){return s%9;}
 static inline int inb(int r,int c){return r>=0&&r<9&&c>=0&&c<9;}
 
-/* black-oriented deltas */
+
 static const int PAWN_D[1][2]={{-1,0}};
 static const int KNIGHT_D[2][2]={{-2,-1},{-2,1}};
 static const int SILVER_D[5][2]={{-1,-1},{-1,0},{-1,1},{1,-1},{1,1}};
@@ -82,56 +78,48 @@ static const int GOLD_D[6][2]={{-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,0}};
 static const int KING_D[8][2]={{-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,-1},{1,0},{1,1}};
 static const int BISHOP_D[4][2]={{-1,-1},{-1,1},{1,-1},{1,1}};
 static const int ROOK_D[4][2]={{-1,0},{1,0},{0,-1},{0,1}};
-/* 事前計算: 利きテーブル(is_attacked高速化) */
+
 typedef struct { int q; uint64_t mask; } StepAtk;
 static StepAtk STEP_ATK[2][81][16]; static int STEP_ATK_N[2][81];
 static int RAY[81][8][9]; static int RAYN[81][8]; static int LANCE_INDIR[2];
-/* [ZYF-OCC 2026-10-05] 81-square occupancy bitboards per colour (bit s of occc[c] = b[s] holds a c piece), kept in Pos
- * by every board write. A step attacker can only stand on STEPBB[by][sq], so most step scans end with one AND; a
- * slider ray finds its first blocker with one AND and a bit scan instead of walking square by square. RAYBB[s][d] holds
- * RAY[s][d]; directions 1,3,6,7 run toward larger square numbers (first blocker = lowest bit), 0,2,4,5 toward smaller
- * ones (highest bit). Every caller still decides on b[blocker] exactly as the square walk did. */
+
 typedef unsigned __int128 ZBB;
 static ZBB SQBB[81]; static ZBB RAYBB[81][8]; static ZBB STEPBB[2][81]; static ZBB MVSTBB[2][15][81]; static ZBB MVREACH[2][15][81];
 static const int RAY_UP[8]={0,1,0,1,0,0,1,1};
 static inline int bb_lsb(ZBB m){ uint64_t lo=(uint64_t)m; return lo?__builtin_ctzll(lo):64+__builtin_ctzll((uint64_t)(m>>64)); }
 static inline int bb_msb(ZBB m){ uint64_t hi=(uint64_t)(m>>64); return hi?127-__builtin_clzll(hi):63-__builtin_clzll((uint64_t)m); }
 static inline int bb_first(ZBB m,int d){ return RAY_UP[d]?bb_lsb(m):bb_msb(m); }
-/* slo[c]/sld[c]: squares of c's rook/dragon/lance and bishop/horse. A ray whose squares hold none of them cannot carry a
- * slider attack, so the scan is skipped. SLOM/SLDM[pc] are all-ones for those piece codes. */
+
 static ZBB SLOM[32], SLDM[32]; static ZBB ORTHBB[81], DIAGBB[81];
-/* STEP_REL[by][q-sq+19]: the STEP_ATK mask of square q for target sq. It depends only on the offset (|dc|<=1, |dr|<=2),
- * so a step scan visits just the by pieces in STEPBB (ascending q, the STEP_ATK order) instead of every listed square. */
+
 static uint64_t STEP_REL[2][39];
 static int MV_ST[2][15][81][8]; static int MV_STN[2][15][81];
 static int MV_SDIR[2][15][4]; static int MV_SDN[2][15];
 static void build_attack_tables(void);
 
-/* zobrist */
+
 static uint64_t Z_PIECE[31][81], Z_HAND[2][8][40], Z_SIDE;
 static uint64_t sm_state;
 static uint64_t sm_next(){ uint64_t z=(sm_state+=0x9E3779B97F4A7C15ULL);
   z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL; z=(z^(z>>27))*0x94D049BB133111EBULL; return z^(z>>31);}
 
-/* [ZYF-TREE 2026-10-05] ybk/yhk: the same position's YaneuraOu key (pos.key() = board_key ^ hand_key), kept
- * incrementally next to Zyfamate's own zobrist so a Zyfamate node can be named in the search's key domain. */
+
 typedef struct { int b[81]; int hand[2][8]; int side; int ksq[2]; uint64_t key; uint64_t bkey; uint64_t ybk, yhk; ZBB occc[2]; ZBB slo[2], sld[2]; } Pos;
 
 typedef struct { int move; int captured; uint64_t prevkey; uint64_t prev_bkey; uint64_t prev_ybk, prev_yhk; } Undo;
 
-/* YaneuraOu Zobrist in Zyfamate's piece/square numbering. Filled once after Position::init() (lazily, from the first
- * ykey_refresh); board_key XORs psq and side (WHITE to move), hand_key adds hand[c][pt] per piece in hand. */
+
 static uint64_t Y_PSQ[31][81], Y_HAND[2][8], Y_SIDE;
 static std::atomic<int> g_y_ready{0};
 static void yo_tables_init(){
   static std::mutex mx; std::lock_guard<std::mutex> lk(mx);
   if(g_y_ready.load(std::memory_order_relaxed)) return;
 #if !defined(ZYFAMATE_HOST_YANEURAOU)
-  g_y_ready.store(1,std::memory_order_release); return;   /* standalone: no search-side key domain (keys stay 0) */
+  g_y_ready.store(1,std::memory_order_release); return;   
 #else
   static_assert(sizeof(YaneuraOu::Zobrist::side)==sizeof(uint64_t), "64-bit YaneuraOu keys");
-  if(!YaneuraOu::Zobrist::side) return;            /* Position::init() has not run yet */
-  /* Zyfamate type -> YaneuraOu PieceType: gold/bishop/rook are ordered differently. */
+  if(!YaneuraOu::Zobrist::side) return;            
+  
   static const int YT[15]={0,1,2,3,4,7,5,6,8,9,10,11,12,13,14};
   for(int pc=0;pc<31;pc++) for(int s=0;s<81;s++){ Y_PSQ[pc][s]=0;
     int t=pc>=16?pc-16:pc; if(t<1||t>14) continue;
@@ -176,7 +164,7 @@ static uint64_t compute_key(Pos*p){
 
 static uint64_t compute_bkey(Pos*p){ uint64_t k=0; for(int s=0;s<81;s++) if(p->b[s]) k^=Z_PIECE[p->b[s]][s];
   if(p->side==WHITE)k^=Z_SIDE; return k; }
-static void refresh_kings(Pos*p){   /* also rebuilds occ: every board loader ends here */
+static void refresh_kings(Pos*p){   
   p->occc[0]=p->occc[1]=p->slo[0]=p->slo[1]=p->sld[0]=p->sld[1]=0;
   for(int s=0;s<81;s++){ int pc=p->b[s]; if(!pc)continue; p->occc[pcolor(pc)]|=SQBB[s];
     p->slo[pcolor(pc)]|=SQBB[s]&SLOM[pc]; p->sld[pcolor(pc)]|=SQBB[s]&SLDM[pc]; }
@@ -184,7 +172,7 @@ static void refresh_kings(Pos*p){   /* also rebuilds occ: every board loader end
   for(int s=0;s<81;s++){int pc=p->b[s]; if(pc&&ptype(pc)==KING)p->ksq[pcolor(pc)]=s;}
 }
 
-/* ---- SFEN parse ---- */
+
 static int char_type(char c){
   switch(c){case 'P':return PAWN;case 'L':return LANCE;case 'N':return KNIGHT;
    case 'S':return SILVER;case 'G':return GOLD;case 'B':return BISHOP;case 'R':return ROOK;
@@ -194,9 +182,7 @@ static int parse_sfen(Pos*p,const char*sfen){
   memset(p,0,sizeof(*p));
   const char*s=sfen; int r=0,c=0,promo=0;
   while(*s==' ')s++;
-  /* [FIX] "sfen <board> ..." プレフィックス付き入力を受理。Pyfamate の
-   * ShogiBoard.sfen() は必ず "sfen " で始まる文字列を返すため、旧実装は
-   * 全呼び出しが parse error になり統合が無音で死んでいた。 */
+  
   if(!strncmp(s,"sfen ",5)){ s+=5; while(*s==' ')s++; }
   while(*s&&*s!=' '){
     char ch=*s++;
@@ -230,7 +216,7 @@ static int parse_sfen(Pos*p,const char*sfen){
   return 1;
 }
 
-/* ---- attack detection ---- */
+
 static void build_attack_tables(void){
   static const int RD[8][2]={{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{-1,1},{1,-1},{1,1}};
   LANCE_INDIR[BLACK]=1; LANCE_INDIR[WHITE]=0;
@@ -273,7 +259,7 @@ static void build_attack_tables(void){
       for(int di=0;di<MV_SDN[col][t];di++) MVREACH[col][t][s]|=RAYBB[s][MV_SDIR[col][t][di]]; }
   }
 }
-/* occ = the occupancy the slider rays see (normally occc[0]|occc[1]; king_move_safe passes it without the king). */
+
 static inline int is_attacked_occ(Pos*p,int sq,int by,const ZBB occ){
   int*b=p->b;
   const StepAtk*sa=STEP_ATK[by][sq]; int n=STEP_ATK_N[by][sq];
@@ -286,13 +272,11 @@ static inline int is_attacked_occ(Pos*p,int sq,int by,const ZBB occ){
   return 0;
 }
 static int is_attacked(Pos*p,int sq,int by){ return is_attacked_occ(p,sq,by,p->occc[0]|p->occc[1]); }
-/* [ZYF-OCC] Same answer as tb_apply(king from->to) + own_safe + tb_revert without moving anything: a step attacker of
- * `to` never stands on `to` or is the moving king, rays from `to` never contain `to`, so only `from` leaving the
- * occupancy matters (a captured piece on `to` is not on any ray from `to`). */
+
 static inline int king_move_safe(Pos*p,int from,int to,int side){ return !is_attacked_occ(p,to,side^1,(p->occc[0]|p->occc[1])&~SQBB[from]); }
 static inline int in_check(Pos*p,int col){return p->ksq[col]>=0 && is_attacked(p,p->ksq[col],col^1);}
 
-/* ---- move gen ---- */
+
 static inline int in_zone(int s,int col){int r=RNK(s);return col==BLACK?r<=2:r>=6;}
 static inline int last_rank(int s,int col){int r=RNK(s);return col==BLACK?r==0:r==8;}
 static inline int last_two(int s,int col){int r=RNK(s);return col==BLACK?r<=1:r>=7;}
@@ -306,10 +290,8 @@ static void emit(int from,int to,int t,int col,int*out,int*n){
   if(!must) out[(*n)++]=MV(from,to,0,0);
 }
 
-/* generate pseudo-legal moves for color; returns count */
-/* [ZYF-OCC] Pieces are visited through occc[col] in ascending square order, as the old 0..80 scan did. With a zone,
- * a piece that is not a discoverer (disc[s]==0) and cannot reach the zone (MVREACH) is skipped: its moves would all be
- * dropped by the caller's zone/discovery filter, so the filtered list is unchanged. */
+
+
 static inline int gen_board_z(Pos*p,int col,int*out,const ZBB zone,const int*disc){
   int n=0; int*b=p->b;
   for(ZBB c=p->occc[col]; c; c&=c-1){ int s=bb_lsb(c);
@@ -326,8 +308,8 @@ static inline int gen_board_z(Pos*p,int col,int*out,const ZBB zone,const int*dis
   }
   return n;
 }
-static int gen_board(Pos*p,int col,int*out){ return gen_board_z(p,col,out,~(ZBB)0,NULL); }   /* board moves only (no drops) */
-static int droppable_at(Pos*p,int col,int t,int to){   /* 打てるか(空升前提) */
+static int gen_board(Pos*p,int col,int*out){ return gen_board_z(p,col,out,~(ZBB)0,NULL); }   
+static int droppable_at(Pos*p,int col,int t,int to){   
   if(t==PAWN){ if(last_rank(to,col)||nifu(p,col,COL(to)))return 0; }
   else if(t==LANCE){ if(last_rank(to,col))return 0; }
   else if(t==KNIGHT){ if(last_two(to,col))return 0; }
@@ -342,10 +324,10 @@ static int gen_pseudo(Pos*p,int col,int*out){
   assert(n<=MAXMOVES); return n;
 }
 
-/* ---- make / unmake ---- */
+
 static __thread Undo ustack[4096]; static __thread int usp=0;
 static void make_move(Pos*p,int m){
-  assert(usp<4095);   /* [FIX-DEPTH-GUARD] 無検査だった。ZYF_MAX_DEPTH が本番での上限。*/
+  assert(usp<4095);   
   int col=p->side; int*b=p->b; uint64_t pk=p->key,pbk=p->bkey,pyb=p->ybk,pyh=p->yhk; int to=M_TO(m);
   if(IS_DROP(m)){int dt=M_DROP(m);int pc=mkpc(dt,col);int cnt=p->hand[col][dt];
     p->key^=Z_HAND[col][dt][cnt]; p->hand[col][dt]=cnt-1; b[to]=pc; p->yhk-=Y_HAND[col][dt]; p->occc[col]|=SQBB[to];
@@ -379,7 +361,7 @@ static void unmake_move(Pos*p){
     if(mt==KING)p->ksq[col]=from;
   }
 }
-/* Key after make_move(p,m), computed without moving (same Zobrist updates as make_move). Used to prefetch TT lines. */
+
 static inline uint64_t child_key(const Pos*p,int m){
   int col=p->side; uint64_t k=p->key^Z_SIDE; int to=M_TO(m);
   if(IS_DROP(m)){ int dt=M_DROP(m); return k^Z_HAND[col][dt][p->hand[col][dt]]^Z_PIECE[mkpc(dt,col)][to]; }
@@ -390,17 +372,14 @@ static inline uint64_t child_key(const Pos*p,int m){
 }
 static inline int own_safe(Pos*p,int mover){int k=p->ksq[mover];return k<0||!is_attacked(p,k,mover^1);}
 
-/* ---- perft ---- */
+
 static long perft(Pos*p,int depth){
   if(depth==0)return 1;
   int mv[MAXMOVES]; int n=gen_pseudo(p,p->side,mv); long tot=0; int col=p->side;
   for(int i=0;i<n;i++){make_move(p,mv[i]); if(own_safe(p,col))tot+=perft(p,depth-1); unmake_move(p);}
   return tot;
 }
-/* [S-1 検証] is_mated(p) == (gen_legal(p)==0) を perft 木の全節点で突き合わせる。
- * is_mated は gen_legal の並べ替え + 早期脱出であり等価でなければならない。
- * 不一致は false mate / 詰み見逃しに直結するので即 abort する。
- * `Zyfamate.exe verify-ismated N` で起動 (テスト専用。探索経路からは呼ばれない)。 */
+
 static int is_mated(Pos*p);
 static int gen_legal(Pos*p,int*out);
 #define IS_MATED_KEEPPINS(p, dst) do { \
@@ -421,14 +400,8 @@ static long perft_verify_ismated(Pos*p,int depth){
 
 #define INF (1<<28)
 
-/* 世代カウンタ(memset回避) */
-/* [ZYF-CTX 2026-10-05] Solver state that a solve() owns (TT, superiority and twin tables, generation, attacker,
- * limits, mate-length memo) lives in a ZCtx. Each thread reads it through the thread_local pointer zc, which starts at
- * the shared context 0, so every existing caller (the service's first lane, MateWorker, MPON, the main thread while
- * the service is paused) keeps using the same tables as before. Cyf_Zyf_Defense's second service lane switches to
- * context 1 (use_context(1)) and so solves concurrently with its own tables. Read-only tables (attack masks, zobrist),
- * table sizes (hash_autosize) and options stay process-wide; g_stop stays shared so a pause stops every lane.
- * The names below are macros for zc->member, so the code and `Zyfamate::g_gen`-style references read as before. */
+
+
 #define TWK 12
 typedef struct { int pn, dn; uint32_t gen; } TTRec;
 typedef struct { uint64_t ah, dh; } SHand;
@@ -473,10 +446,7 @@ static inline void use_context(int i){ zc=&g_ctx[i==1?1:0]; }
 #define lm_honor_stop zc->lm_honor_stop_
 #define lm_deadline zc->lm_deadline_
 #define g_tes_deadline zc->g_tes_deadline_
-/* ==== ハッシュ表の実行時自動サイズ (8GB〜2TB のどの機種でも適正化) ====
- * 物理RAMを起動時に検出し、総予算 = RAM/16 を [256MB, 8GB] にクランプ。
- * one-shot CLI なので過大確保は起動コスト増 — 上限は控えめにする。
- * 環境変数 ZYFAMATE_HASH_MB で明示指定可 (親プロセスから調整できる)。 */
+
 #ifdef _WIN32
 #else
 #endif
@@ -491,18 +461,16 @@ static uint64_t phys_ram_bytes(void){
     long pg=sysconf(_SC_PHYS_PAGES), ps=sysconf(_SC_PAGE_SIZE);
     if(pg>0&&ps>0) return (uint64_t)pg*(uint64_t)ps;
 #endif
-    return 8ULL<<30; /* 検出不能時は 8GB 相当として控えめに */
+    return 8ULL<<30; 
 }
 static unsigned fit_bits(uint64_t budget,unsigned entry,unsigned lo,unsigned hi){
     unsigned b=lo; while(b<hi && ((uint64_t)entry<<(b+1))<=budget) b++; return b;
 }
 static void hash_autosize_once(void);
-static void hash_autosize(void){ static std::once_flag once; std::call_once(once,hash_autosize_once); }   /* [ZYF-CTX] lanes may race */
+static void hash_autosize(void){ static std::once_flag once; std::call_once(once,hash_autosize_once); }   
 static void hash_autosize_once(void){
     uint64_t budget; const char*ev=getenv("ZYFAMATE_HASH_MB");
-    /* [FIX-HASH-CLAMP] env 経路は無制限だった。malloc は戻り値を検査していないので
-     * (下記 zmalloc 参照) 過大指定は NULL 参照 = segfault になる。物理RAMの半分と
-     * 16MB を上下限にクランプし、親プロセスの設定ミスを事故にしない。 */
+    
     if(ev&&atoll(ev)>0){ budget=(uint64_t)atoll(ev)<<20;
            uint64_t cap=phys_ram_bytes()/2;
            if(budget<(16ULL<<20))budget=16ULL<<20;
@@ -510,7 +478,7 @@ static void hash_autosize_once(void){
     else { budget=phys_ram_bytes()/16;
            if(budget<(256ULL<<20))budget=256ULL<<20;
            if(budget>(8ULL<<30))budget=8ULL<<30; }
-    /* エントリ実測: TT=20B, 優越表=2×sizeof(SEnt)=64B, twin≈106B */
+    
     tt_bits=fit_bits(budget*55/100,20,20,30);
     st_bits=fit_bits(budget*35/100,64,18,28);
     tw_bits=fit_bits(budget*10/100,106,16,24);
@@ -527,41 +495,32 @@ static void hash_autosize_once(void){
 #define STBITS st_bits
 #define TWSIZE tw_size
 #define TWMASK tw_mask
-/* [FIX-ALLOC-CHECK] 全ての表の malloc/calloc は戻り値を検査していなかった。GB級の
- * 確保が失敗すると NULL のまま探索に入り segfault する (「表が確保できなかった」と
- * いう最も診断しやすい失敗が、最も診断しにくいクラッシュに化けていた)。ここで
- * 明示的に落とす。malloc/calloc をそのまま呼ぶので、埋め込み側の
- * `#define malloc(s) Zyfamate::_zmalloc(s)` プロキシは従来通り効く。 */
+
 static void zchk(const void*q,const char*what,uint64_t bytes){
   if(!q){ fprintf(stderr,"info string FATAL: Zyfamate could not allocate %s (%llu MB). "
                   "Lower ZYFAMATE_HASH_MB.\n",what,(unsigned long long)(bytes>>20));
           fflush(stderr); exit(1); }
 }
-/* [埋め込み互換] 確保は必ず**代入式のその場**で行い、検査だけを別に回す。
- * cyfamate.cpp は `#define malloc(s) Zyfamate::_zmalloc(s)` で確保をプロキシ型
- * `_CMul{ template<class T> operator T*() const }` に差し替えており、代入先の型 T へ
- * **暗黙変換**することで動いている。ここで `p = zchk(malloc(n))` のように void* を
- * 返す関数を挟むと、C では通っても **C++ では void*→T* の暗黙変換が無いためコンパイル
- * エラー**になり、埋め込みビルドが 12 箇所で壊れる (実機 g++ 16.1.0 で確認済み)。
- * 代入をマクロ内に閉じ込めれば、プロキシの変換演算子が従来どおり働く。 */
+
+#if defined(ZYFAMATE_HOST_YANEURAOU)
+
+static void* zyf_big_alloc(size_t n){ if(n < (2u<<20)) return (std::malloc)(n); void* p = YaneuraOu::aligned_large_pages_alloc(n); if(p) std::memset(p,0,n); return p; }
+#define ZMALLOC(lhs,n,what)     do{ (lhs)=(decltype(lhs))zyf_big_alloc(n);        zchk((lhs),(what),(uint64_t)(n)); }while(0)
+#define ZCALLOC(lhs,c,s,what)   do{ size_t _zn=(size_t)(c)*(size_t)(s); (lhs)=(decltype(lhs))(_zn < (2u<<20) ? (void*)(std::calloc)((c),(s)) : zyf_big_alloc(_zn)); zchk((lhs),(what),(uint64_t)_zn); }while(0)
+
+#else
 #define ZMALLOC(lhs,n,what)     do{ (lhs)=malloc(n);        zchk((lhs),(what),(uint64_t)(n)); }while(0)
 #define ZCALLOC(lhs,c,s,what)   do{ (lhs)=calloc((c),(s));  zchk((lhs),(what),(uint64_t)(c)*(uint64_t)(s)); }while(0)
-/* TT */
-/* [ZYF-TT-LAYOUT 2026-10-05] Keys stay in their own array (8 keys = one 64B line, the probe window) and pn/dn/gen
- * share one 12B record, so a probe reads the key line(s) and touches the record line only on a key match; the old
- * layout (key, pn, dn, gen in four arrays, gen tested first) touched up to four lines per probe. Probe order, slot
- * choice and replacement are unchanged, so the search (nodes, verdicts) is identical. 8+12B = the old 20B/entry. */
-/* TTRec, tt_key, tt_rec: ZCtx */
+#endif
+
+
+
 static void tt_init(){ hash_autosize(); if(!tt_key){ ZMALLOC(tt_key,sizeof(uint64_t)*TTSIZE,"tt_key"); ZCALLOC(tt_rec,TTSIZE,sizeof(TTRec),"tt_rec");} }
 static inline void tt_prefetch(uint64_t k){ __builtin_prefetch(&tt_key[k&TTMASK]); __builtin_prefetch(&tt_key[(k+7)&TTMASK]);
   __builtin_prefetch(&tt_rec[k&TTMASK]); }
 static inline void tt_clear_gen(){ for(size_t i=0;i<TTSIZE;i++) tt_rec[i].gen=0; }
-/* g_attacker: ZCtx */
-/* [ZY01-KEEP-PROOFS 2026-10-02] Opt-in proof retention across solve() calls (cf. Suisho-BM KeepOnlyProofs).
- * Off (default): the code paths below are the original ones. On: a proof (pn==0, dn>=INF) is tagged PROOF_GEN
- * and stays readable by later solves; every other entry still dies with g_gen, and twins are still cleared per
- * solve, so path-dependent disproofs are never carried over. Proofs are already unconditional in finalize_ghi.
- * pn/dn mean "for g_attacker", so keys are salted by the attacker colour while keeping proofs. */
+
+
 #define PROOF_GEN 0xFFFFFFFFu
 static int g_keep_proofs=0; static std::atomic<long> g_proof_hits{0};
 static inline uint64_t tt_salt(){ return g_attacker ? 0x9E3779B97F4A7C15ULL : 0x5851F42D4C957F2DULL; }
@@ -581,16 +540,11 @@ static void tt_store(uint64_t k,int pn,int dn){ if(g_keep_proofs){ tt_store_keep
   if(slot<0)slot=(fr>=0?fr:i);
   tt_rec[slot].gen=g_gen;tt_key[slot]=k;tt_rec[slot].pn=pn;tt_rec[slot].dn=dn;}
 
-static unsigned g_order_variant=0; // Independent-process portfolio, identical legal move sets.
-/* ---- 優越関係(証明駒/反証駒) ---- */
+static unsigned g_order_variant=0; 
+
 #define STPROBE 16
-/* [ZYF-SUP-SOA 2026-10-05] Each superiority table is three arrays: board keys, generations and packed hands (byte t-1 =
- * count of hand type t, byte 7 = 0). A probe of the 16-slot window reads 128B of keys and 64B of generations and
- * touches a hand record only on a key match; the old 32B entries spread the window over 512B. Window, order, match
- * and replacement rules are those of the old loops, so the search is unchanged. 8+4+16=28B/entry (old: 32B).
- * An AVX-512 window compare (16 gens in one compare, 16 keys in two) kept the search identical but was ~15% slower
- * than this scalar loop on the avx512_vnni bench (AVX2: no gain), so it is not used. */
-/* SHand, SupTab, proof_tab(_s), nomate_tab(_s): ZCtx */
+
+
 static int use_superior=1;
 static void sup_alloc(SupTab*t,const char*what){ ZCALLOC(t->bk,STSIZE,sizeof(uint64_t),what); ZCALLOC(t->gen,STSIZE,sizeof(uint32_t),what);
   ZCALLOC(t->h,STSIZE,sizeof(SHand),what); }
@@ -599,48 +553,42 @@ static void sup_init(){ hash_autosize(); if(!proof_tab){ sup_alloc(&proof_tab_s,
   proof_tab=&proof_tab_s; nomate_tab=&nomate_tab_s; } }
 static inline int sup_idx(uint64_t bk){ return (int)((bk*0x9E3779B97F4A7C15ULL)>>(64-STBITS)); }
 static inline uint64_t hand_pack(Pos*p,int col){ uint64_t h=0; for(int t=1;t<=7;t++) h|=(uint64_t)(uint8_t)p->hand[col][t]<<(8*(t-1)); return h; }
-/* a[i]<=b[i] for every byte: counts are <128, so (b|0x80)-a keeps bit 7 of a byte exactly when a<=b, with no borrow. */
+
 static inline int subseteq(uint64_t a,uint64_t b){ const uint64_t H=0x8080808080808080ULL; return (((b|H)-a)&H)==H; }
-/* Bits j (0..15) of the window i0..i0+15: *live = gen is current, *hit = gen current and key == bk. */
+
 static inline void sup_masks(const SupTab*t,int i0,uint64_t bk,unsigned*live,unsigned*hit){
   unsigned g=0,k=0; for(int j=0;j<STPROBE;j++){ int x=(i0+j)&STMASK; if(t->gen[x]==g_gen){ g|=1u<<j; if(t->bk[x]==bk) k|=1u<<j; } }
   *live=g; *hit=k;
 }
-/* è©°ã¿ä¸€èˆ¬åŒ–: e.ahâŠ†A ã‹ã¤ e.dhâŠ‡D ã®è¨¼æ˜Žæ¸ˆã¿å±€é¢ãŒã‚ã‚Œã°ç¾å±€é¢ã‚‚è©°ã¿ */
+
 static int sup_mate(uint64_t bk,uint64_t A,uint64_t D){ int i0=sup_idx(bk); unsigned live,hit; sup_masks(proof_tab,i0,bk,&live,&hit);
   for(;hit;hit&=hit-1){ const SHand*e=&proof_tab->h[(i0+__builtin_ctz(hit))&STMASK]; if(subseteq(e->ah,A)&&subseteq(D,e->dh))return 1; } return 0; }
-/* ä¸è©°ä¸€èˆ¬åŒ–(åƒæ—¥æ‰‹éžä¾å­˜ã®ã¿è¨˜éŒ²): e.ahâŠ‡A ã‹ã¤ e.dhâŠ†D ã®ä¸è©°å±€é¢ãŒã‚ã‚Œã°ç¾å±€é¢ã‚‚ä¸è©° */
+
 static int sup_nomate(uint64_t bk,uint64_t A,uint64_t D){ int i0=sup_idx(bk); unsigned live,hit; sup_masks(nomate_tab,i0,bk,&live,&hit);
   for(;hit;hit&=hit-1){ const SHand*e=&nomate_tab->h[(i0+__builtin_ctz(hit))&STMASK]; if(subseteq(A,e->ah)&&subseteq(e->dh,D))return 1; } return 0; }
-/* The old loop: the first live slot with key bk is refreshed; otherwise the first stale slot, else slot i0, is taken. */
+
 static void sup_rec(SupTab*tab,uint64_t bk,uint64_t A,uint64_t D){ int i0=sup_idx(bk); unsigned live,hit; sup_masks(tab,i0,bk,&live,&hit);
   if(hit){ SHand*e=&tab->h[(i0+__builtin_ctz(hit))&STMASK]; e->ah=A; e->dh=D; return; }
   unsigned fr=~live&((1u<<STPROBE)-1); int s=fr?(i0+__builtin_ctz(fr))&STMASK:(i0&STMASK);
   tab->gen[s]=g_gen; tab->bk[s]=bk; tab->h[s].ah=A; tab->h[s].dh=D; }
 
-static __thread long g_nodes; static __thread jmp_buf g_jmp;   /* g_limit, g_t0, g_tlimit: ZCtx */
-/* [ZY01-STOP-REASON] why the last solve() on this thread returned unknown: 0 none, 1 node limit, 2 time limit,
- * 3 external g_stop, 4 depth guard. Lets a caller keep "budget ran out" apart from "cancelled". */
+static __thread long g_nodes; static __thread jmp_buf g_jmp;   
+
 static __thread int g_stop_reason=0;
-// Short native jobs must observe their clock and cancellation before a long node batch.
+
 static __thread unsigned g_poll_mask=8191;
 static std::atomic<int> g_stop{0}; static int g_parallel=0;
 static volatile int g_usi_mode=0; static double g_usi_last_info=0;
 static __thread uint64_t g_path[4096]; static __thread int g_pathlen;
 static int on_path(uint64_t k){for(int i=0;i<g_pathlen;i++)if(g_path[i]==k)return 1;return 0;}
 
-/* ===== GHI対策: base/twin法 (Kishimoto & Müller 2004, 簡略版) ===== */
-/* TWK, tw_key, tw_cause, tw_n, tw_used: ZCtx */
-/* [ZYF-TW-LIVE 2026-10-05] Number of slots with tw_used==1. twin_find can only return a slot with tw_used==1, so with
- * none live it returns -1 without touching the table (most solves have few or no GHI twins). */
-/* tw_live: ZCtx */
+
+
+
+
 static void twin_init(){ hash_autosize(); if(!tw_key){ ZMALLOC(tw_key,sizeof(uint64_t)*TWSIZE,"tw_key"); ZMALLOC(tw_cause,sizeof(uint64_t)*TWK*TWSIZE,"tw_cause");
     ZMALLOC(tw_n,TWSIZE,"tw_n"); ZMALLOC(tw_used,TWSIZE,"tw_used");} memset(tw_used,0,TWSIZE); tw_live=0; }
-/* [FIX-TWIN-NULL] solve_parallel は tt_init/wk_init しか呼ばず twin_init を呼ばないため、
- * tw_used が NULL のまま can_mate (dn==0&&pn>=INF 枝) から到達し得る。実測では発火を
- * 再現できなかった (「並列が証明できる易しい詰み」×「can_mate が (INF,0) 節点に降りる」
- * の2条件がほぼ排他) が、mate_length 入口で tw_used=0x0 を実測しており潜在的な NULL
- * 参照であることは確認済み。ここで塞げば全呼び元 (can_mate/first_mate_move) が同時に守られる。*/
+
 static int twin_find(uint64_t k){ if(!tw_used || tw_live==0) return -1;
   int i=(int)(k&TWMASK); for(int j=0;j<8;j++){int x=(i+j)&TWMASK;
   if(tw_used[x]==0)return -1; if(tw_used[x]==1&&tw_key[x]==k)return x;} return -1; }
@@ -649,15 +597,7 @@ static void twin_put(uint64_t k,const uint64_t*causes,int n){ if(n>TWK)n=TWK;
   int i=(int)(k&TWMASK),slot=-1; for(int j=0;j<8;j++){int x=(i+j)&TWMASK;
     if(tw_used[x]==1&&tw_key[x]==k){slot=x;break;} if(tw_used[x]!=1&&slot<0)slot=x; if(tw_used[x]==0)break;}
   if(slot<0)slot=i&TWMASK;
-  /* [FIX-TWIN-VICTIM] 8スロット全部が別キーで live のとき、ここは他人の live twin を
-   * 無言で潰していた。twin は「この不詰は千日手に依存する」という条件を保持しており、
-   * TT 側には finalize_ghi が書いた生の (INF,0) が残る。twin だけ消えると
-   * tt_read_ghi が twin 枝を通らず (INF,0) をそのまま返す = 経路依存の不詰が
-   * 無条件 nomate に昇格 (false nomate)。さらに sup_rec(nomate_tab) 経由で
-   * 持駒の上位集合すべてに一般化されて伝播する。犠牲者の TT を「未知」(1,1) に
-   * 戻し、再探索を強制することで条件を復元する (別ノードなので無限ループしない)。
-   * 注: tt_store 側の同型の盲目上書き (下記 tt_store) は TT が純キャッシュなので
-   * 健全性は損なわない。健全性を持つのは twin だけ。 */
+  
   if(tw_used[slot]==1 && tw_key[slot]!=k) tt_store(tw_key[slot],1,1);
   if(tw_used[slot]!=1) ++tw_live; tw_used[slot]=1; tw_key[slot]=k; tw_n[slot]=n;
   for(int t=0;t<n;t++)tw_cause[slot][t]=causes[t]; }
@@ -679,11 +619,7 @@ static double now(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); ret
 
 static const int RD8[8][2]={{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{-1,1},{1,-1},{1,1}};
 static __thread int g_pin[81];
-/* [FIX-VERIFY-DEAD] g_verify は宣言と 2 箇所の read しか存在せず、**書き込みが無かった**
- * ため到達不能 (-O3 では常に 0 と証明されて両ブロックごと削除される) = 生成器の
- * クロスチェック機構が存在しないのと同じだった。VERIFY 環境変数で有効化する。
- * 埋め込み側からは同一TU内なので `Zyfamate::g_verify=1;` で直接叩ける。非static関数を
- * 生やすとファイル唯一の外部シンボルになり埋め込み時の衝突面になるので置かない。 */
+
 static int g_verify=0;
 static int isPinner(int Qpc,int d){ int t=ptype(Qpc);
   if(d<4){ if(t==ROOK||t==DRAGON)return 1;
@@ -700,16 +636,15 @@ static inline int colinearK(Pos*p,int K,int to,int pinidx){
   (void)p; int d=pinidx-1; int tr=RNK(to)-RNK(K), tc=COL(to)-COL(K);
   return tr*RD8[d][1]==tc*RD8[d][0]; }
 static __thread int g_disc[81];
-static void compute_disc(Pos*p,int att){      /* 開き王手の元(攻方駒が dk と攻方走り駒の間) */
+static void compute_disc(Pos*p,int att){      
   for(int i=0;i<81;i++)g_disc[i]=0;
   int dk=p->ksq[att^1]; if(dk<0)return; int*b=p->b; const ZBB occ=p->occc[0]|p->occc[1];
   for(int d=0;d<8;d++){ ZBB m=occ&RAYBB[dk][d]; if(!m)continue; int cand=bb_first(m,d);
     if(pcolor(b[cand])!=att)continue; m&=~SQBB[cand]; if(!m)continue; int pc=b[bb_first(m,d)];
     if(pcolor(pc)==att && isPinner(pc,d))g_disc[cand]=d+1; }
 }
-static int attacks_sq(Pos*p,int to,int T,int att,int dk,int from){ /* 型Tの攻方駒がtoからdkを攻めるか */
-  /* dk holds the defending king, so "dk comes before any other piece on the ray, from treated as empty" is
-   * "dk is the first blocker of occ minus from" (same answer as the square walk). */
+static int attacks_sq(Pos*p,int to,int T,int att,int dk,int from){ 
+  
   if(MVSTBB[att][T][to]&SQBB[dk]) return 1;
   int sdn=MV_SDN[att][T]; if(!sdn) return 0;
   ZBB occ=p->occc[0]|p->occc[1]; if(from<81) occ&=~SQBB[from];
@@ -719,11 +654,11 @@ static int attacks_sq(Pos*p,int to,int T,int att,int dk,int from){ /* 型Tの攻
 static int gives_check_fast(Pos*p,int m,int att,int dk){
   int to=M_TO(m), from=M_FROM(m), T;
   if(from==DROP_FROM)T=M_DROP(m); else {int mt=ptype(p->b[from]); T=M_PROMO(m)?PROMO[mt]:mt;}
-  if(attacks_sq(p,to,T,att,dk,from)) return 1;                 /* 直接王手 */
-  if(from!=DROP_FROM && g_disc[from] && !colinearK(p,dk,to,g_disc[from])) return 1; /* 開き王手 */
+  if(attacks_sq(p,to,T,att,dk,from)) return 1;                 
+  if(from!=DROP_FROM && g_disc[from] && !colinearK(p,dk,to,g_disc[from])) return 1; 
   return 0;
 }
-/* 利き判定専用の軽量着手(盤面とking_sqのみ更新, 置換/持駒/keyは触らない) */
+
 typedef struct { int from,to,moved,cap,kfrom; } TB;
 static inline TB tb_apply(Pos*p,int m){
   int*b=p->b; int col=p->side; int to=M_TO(m); TB t; t.to=to; t.kfrom=-1;
@@ -744,37 +679,33 @@ static inline void tb_revert(Pos*p,TB t){
   { int c=p->side; p->slo[c]=(p->slo[c]&~SQBB[t.to])|(SQBB[t.from]&SLOM[t.moved]); p->sld[c]=(p->sld[c]&~SQBB[t.to])|(SQBB[t.from]&SLDM[t.moved]);
     p->slo[c^1]|=SQBB[t.to]&SLOM[t.cap]; p->sld[c^1]|=SQBB[t.to]&SLDM[t.cap]; }
 }
-/* 攻方の王手生成(打ち歩詰を除外) */
+
 static int gen_checks(Pos*p,int*out){
   int att=p->side, def=att^1; int K=p->ksq[att];
   int incheck=(K>=0 && is_attacked(p,K,def));
   compute_pins(p,att); compute_disc(p,att); int dk=p->ksq[def];
   int*b=p->b; int m=0;
-  if(incheck || dk<0){                       /* 稀: 攻方が王手されている等は旧法 */
+  if(incheck || dk<0){                       
     int pm[MAXMOVES]; int n=gen_pseudo(p,att,pm);
     for(int i=0;i<n;i++){ int mv=pm[i],from=M_FROM(mv); TB t=tb_apply(p,mv); int legal=own_safe(p,att); tb_revert(p,t);
       if(!legal)continue; if(!(dk>=0&&gives_check_fast(p,mv,att,dk)))continue;
-      /* [S-1] 打歩詰判定: 旧実装は gen_pseudo で受け方の全 pseudo-legal 手 (81升走査 +
-       * 全打ち先) を作ってから逃れ手を探していた。is_mated は王手回避に特化した
-       * 生成 (玉の逃げ→取り→合駒) を早期脱出付きで行うので同一判定をずっと安く出す。
-       * make_move を tb_apply に落としてはならない — tb_apply は p->side で駒を着色し
-       * ksq も p->side で戻すため、side を反転せずに受け方の逃げを組み立てられない。*/
+      
       if(from==DROP_FROM&&M_DROP(mv)==PAWN){ make_move(p,mv); int mated; IS_MATED_KEEPPINS(p,mated); unmake_move(p); if(mated)continue; }
       out[m++]=mv; }
   } else {
-    ZBB zone=STEPBB[att][dk]; for(int d=0;d<8;d++) zone|=RAYBB[dk][d];   /* [ZYF-OCC] old inzone[]: 直接王手になり得る升(健全な上位集合) */
-    int bm[MAXMOVES]; int bn=gen_board_z(p,att,bm,zone,g_disc);                 /* 盤上の王手手 */
+    ZBB zone=STEPBB[att][dk]; for(int d=0;d<8;d++) zone|=RAYBB[dk][d];   
+    int bm[MAXMOVES]; int bn=gen_board_z(p,att,bm,zone,g_disc);                 
     for(int i=0;i<bn;i++){ int mv=bm[i],from=M_FROM(mv),to=M_TO(mv);
-      if(!(zone&SQBB[to]) && !g_disc[from]) continue;              /* 直接王手の可能性なし且つ開き王手でない→非王手 */
+      if(!(zone&SQBB[to]) && !g_disc[from]) continue;              
       int mt=ptype(b[from]); int legal;
       if(mt==KING){ legal=king_move_safe(p,from,to,att); }
       else legal=!g_pin[from]||colinearK(p,K,M_TO(mv),g_pin[from]);
       if(!legal)continue; if(!gives_check_fast(p,mv,att,dk))continue; out[m++]=mv; }
-    /* 王手になる打ちだけ直接生成(玉に利く升のみ) */
+    
     const StepAtk*sa=STEP_ATK[att][dk]; int sn=STEP_ATK_N[att][dk];
     for(int i=0;i<sn;i++){ int q=sa[i].q; if(b[q])continue; uint64_t mask=sa[i].mask;
       if((mask&(1ULL<<mkpc(PAWN,att)))&&p->hand[att][PAWN]&&droppable_at(p,att,PAWN,q)){
-        /* [S-1] 打歩詰判定を is_mated に (上記 in-check 枝と同じ理由)。 */
+        
         int mv=MV(DROP_FROM,q,0,PAWN); make_move(p,mv); int mated; IS_MATED_KEEPPINS(p,mated); unmake_move(p);
         if(!mated) out[m++]=mv; }
       if((mask&(1ULL<<mkpc(KNIGHT,att)))&&p->hand[att][KNIGHT]&&droppable_at(p,att,KNIGHT,q)) out[m++]=MV(DROP_FROM,q,0,KNIGHT);
@@ -802,7 +733,7 @@ static int gen_checks(Pos*p,int*out){
   }
   assert(m<=MAXMOVES); return m;
 }
-/* 王手している敵駒の升を chk[] に集める(最大2)。is_attacked と同一構造で照合 */
+
 static int find_checkers(Pos*p,int side,int K,int*chk){
   int by=side^1,nc=0;
   const StepAtk*sa=STEP_ATK[by][K]; int n=STEP_ATK_N[by][K];
@@ -816,15 +747,14 @@ static int find_checkers(Pos*p,int side,int K,int*chk){
       if(hit){ if(nc<2)chk[nc]=sq; nc++; } } }
   return nc;
 }
-/* 単独王手駒 C への取り升と、K-C 間の合駒升を tgt[] にマーク */
+
 static void build_targets(int K,int C,char*tgt,int*btw,int*nb){
   tgt[C]=1; *nb=0; int kr=K/9,kc=K%9,cr=C/9,cc=C%9; int dr=cr-kr,dc=cc-kc;
   if(dr==0||dc==0||dr==dc||dr==-dc){ int sr=(dr>0)-(dr<0),sc=(dc>0)-(dc<0);
     int r=kr+sr,c=kc+sc; while(r!=cr||c!=cc){ int s=r*9+c; tgt[s]=1; btw[(*nb)++]=s; r+=sr; c+=sc; } }
 }
-/* 合法手生成: 王手時は回避手(玉逃げ/取り/合駒)だけ利き判定し is_attacked を激減 */
-/* 目標升 T へ動ける side の駒(非玉)を生成(逆引き)。is_attacked と同じ分割で重複なし。
-   王手回避の取り/合駒に用い、合法性はピンで判定(利き判定を回避)。 */
+
+
 static void gen_moves_to(Pos*p,int side,int T,int*out,int*pm,int K){
   int tp=p->b[T]; if(tp && (pcolor(tp)==side||ptype(tp)==KING)) return;
   for(ZBB c=p->occc[side]&STEPBB[side][T]; c; c&=c-1){ int s=bb_lsb(c); int pc=p->b[s];
@@ -839,7 +769,7 @@ static void gen_moves_to(Pos*p,int side,int T,int*out,int*pm,int K){
 }
 static int gen_legal(Pos*p,int*out){
   int side=p->side, K=p->ksq[side]; int m=0;
-  /* [ZYF-OCC] find_checkers applies exactly is_attacked's tests, so nc>0 <=> in check; one scan serves both. */
+  
   int chk[2]; int nc=K>=0?find_checkers(p,side,K,chk):0; int incheck=(nc>0);
   if(!incheck){
     compute_pins(p,side);
@@ -855,12 +785,12 @@ static int gen_legal(Pos*p,int*out){
       for(int i=0;i<n;i++){ TB t=tb_apply(p,pm[i]); if(own_safe(p,side))out[m++]=pm[i]; tb_revert(p,t);} }
     else { char tgt[81]; memset(tgt,0,81); int btw[16],nb=0; if(nc==1) build_targets(K,chk[0],tgt,btw,&nb);
       compute_pins(p,side);
-      { int*st=MV_ST[side][KING][K]; int sn=MV_STN[side][KING][K];          /* 玉の逃げ */
+      { int*st=MV_ST[side][KING][K]; int sn=MV_STN[side][KING][K];          
         for(int k=0;k<sn;k++){ int to=st[k]; int tp=p->b[to]; if(tp&&(pcolor(tp)==side||ptype(tp)==KING))continue;
           int mv=MV(K,to,0,0); if(king_move_safe(p,K,to,side))out[m++]=mv; } }
-      if(nc==1){ gen_moves_to(p,side,chk[0],out,&m,K);                       /* 王手駒を取る(非玉) */
-        for(int j=0;j<nb;j++) gen_moves_to(p,side,btw[j],out,&m,K);          /* 合駒(盤上, 非玉) */
-        static const int HT[7]={PAWN,LANCE,KNIGHT,SILVER,GOLD,BISHOP,ROOK};  /* 合駒(打ち, 常に合法) */
+      if(nc==1){ gen_moves_to(p,side,chk[0],out,&m,K);                       
+        for(int j=0;j<nb;j++) gen_moves_to(p,side,btw[j],out,&m,K);          
+        static const int HT[7]={PAWN,LANCE,KNIGHT,SILVER,GOLD,BISHOP,ROOK};  
         for(int j=0;j<nb;j++){ int s=btw[j];
           for(int hi=0;hi<7;hi++){ int t=HT[hi]; if(p->hand[side][t]==0)continue;
             if(droppable_at(p,side,t,s)) out[m++]=MV(DROP_FROM,s,0,t); } } }
@@ -874,48 +804,11 @@ static int gen_legal(Pos*p,int*out){
 }
 static int has_legal(Pos*p,int side){int pm[MAXMOVES];int n=gen_pseudo(p,side,pm);
   for(int i=0;i<n;i++){ TB t=tb_apply(p,pm[i]); int ok=own_safe(p,side); tb_revert(p,t); if(ok)return 1;} return 0;}
-/* [S-1] 「手番側に合法手が無い(=詰んでいる)か」の述語。gen_legal の構造を逐語で保ちつつ、
- * 最初の合法手で即 return 0 する。gen_legal との差は「リストを作らない」ことだけで、
- * 判定は同一。実測で mate_search(g_mfd=3) が runtime の ~70% を占めており、その葉は
- * 例外なく「gen_legal をフル生成して nd==0 だけ見る」形だった (dm[] はどの depth でも
- * 一度も読まれない = 純粋な存在判定にフル生成の代金を払っていた)。
- *
- * 早期脱出で省けるもの (詰みでない局面 = 圧倒的多数):
- *   - 王手駒を取る手 / 合駒 (gen_moves_to) の全生成
- *   - 打ち合駒の 7*nb 二重ループ
- *   - build_targets と compute_pins (その第1文は g_pin の 81 要素クリア)
- * 真の詰み局面 (逃れ無し) では全部歩くので高速化はゼロ — それでよい (数が少ない)。
- *
- * 順序に関する重要事項:
- *  (a) 玉の逃げを compute_pins より**前**に置いてある。玉の逃げの合法性は tb_apply +
- *      own_safe で判定され g_pin を使わないので安全であり、逃げが1つでもあれば
- *      compute_pins/build_targets を丸ごと払わずに済む (これが本命の節約)。
- *      gen_moves_to は g_pin を使うので、その前には必ず compute_pins を通す。
- *  (b) 玉の逃げは**必ず tb_apply して**判定する。玉自身が王手線を塞いでいるため、
- *      玉を置いたまま is_attacked(逃げ先) を見ると飛/香の王手線が隠れて安全と誤判定する。
- *  (c) nc==0 (is_attacked と find_checkers の不整合) の防御的 fallback を逐語で残す。
- *      ここを落とすと false mate になり得る。
- *  (d) nc>=2 (両王手) は玉の逃げのみ。build_targets は単独王手を前提としている。 */
-/* [S-1 HAZARD — 必読] is_mated は内部で compute_pins(p,side) を呼び得るため、
- * **thread-local の g_pin を手番側 (= 受け方) 視点で上書きする副作用を持つ**。
- * g_disc は触らない (compute_disc を呼ばない)。
- *
- * 現状の呼び元と、なぜ安全か:
- *  - mate_search_with: g_pin を読まないので無関係。
- *  - gen_checks: 自分の g_pin (攻方視点) を `legal=!g_pin[from]||colinearK(p,K,...)` で
- *    読む。**読みは盤上手ループで完了し、is_mated を呼ぶ打ちループはその後**なので
- *    今日は順序で救われているが、その順序を強制するものは何も無い。壊れた場合の症状は
- *    「非合法手を王手として生成 = **false mate**」= 最悪。よって gen_checks 側の
- *    2 箇所の呼び出しを IS_MATED_KEEPPINS() で包み、順序への依存を断つ。
- *
- * 保存・復元を is_mated 内部でなく呼び元に置く理由: 受け方が王手されている通常ケース
- * (mate_search_with の全呼び出し) では、is_mated は玉の逃げが1つ見つかった時点で
- * compute_pins に到達せず return する。内部に置くと、その最ホットパス
- * (実測 runtime の大半) に無駄な 324B memcpy 2 回が乗り、実測で 1.4-2.7% 遅くなった。
- * 保護が要るのは gen_checks の希少な打歩詰パスだけなので、そこにだけ置く。 */
+
+
 static int is_mated(Pos*p){
   int side=p->side, K=p->ksq[side];
-  /* [ZYF-OCC] find_checkers applies exactly is_attacked's tests, so nc>0 <=> in check; one scan serves both. */
+  
   int chk[2]; int nc=K>=0?find_checkers(p,side,K,chk):0; int incheck=(nc>0);
   if(!incheck){
     compute_pins(p,side);
@@ -928,115 +821,59 @@ static int is_mated(Pos*p){
       if(legal) return 0; }
     return 1;
   }
-  if(nc==0){ int pm[MAXMOVES]; int n=gen_pseudo(p,side,pm);          /* (c) 防御的 fallback */
+  if(nc==0){ int pm[MAXMOVES]; int n=gen_pseudo(p,side,pm);          
     for(int i=0;i<n;i++){ TB t=tb_apply(p,pm[i]); int ok=own_safe(p,side); tb_revert(p,t); if(ok)return 0; }
     return 1; }
-  { int*st=MV_ST[side][KING][K]; int sn=MV_STN[side][KING][K];        /* 玉の逃げ (a)(b) */
+  { int*st=MV_ST[side][KING][K]; int sn=MV_STN[side][KING][K];        
     for(int k=0;k<sn;k++){ int to=st[k]; int tp=p->b[to]; if(tp&&(pcolor(tp)==side||ptype(tp)==KING))continue;
       if(king_move_safe(p,K,to,side))return 0; } }
-  if(nc>=2) return 1;                                                 /* (d) 両王手 */
+  if(nc>=2) return 1;                                                 
   { char tgt[81]; memset(tgt,0,81); int btw[16],nb=0; build_targets(K,chk[0],tgt,btw,&nb);
     compute_pins(p,side);
     int tmp[MAXMOVES]; int m;
-    m=0; gen_moves_to(p,side,chk[0],tmp,&m,K); if(m) return 0;        /* 王手駒を取る(非玉) */
-    for(int j=0;j<nb;j++){ m=0; gen_moves_to(p,side,btw[j],tmp,&m,K); if(m) return 0; }  /* 合駒(盤上) */
+    m=0; gen_moves_to(p,side,chk[0],tmp,&m,K); if(m) return 0;        
+    for(int j=0;j<nb;j++){ m=0; gen_moves_to(p,side,btw[j],tmp,&m,K); if(m) return 0; }  
     static const int HT[7]={PAWN,LANCE,KNIGHT,SILVER,GOLD,BISHOP,ROOK};
-    for(int j=0;j<nb;j++){ int s=btw[j];                              /* 合駒(打ち, 常に合法) */
+    for(int j=0;j<nb;j++){ int s=btw[j];                              
       for(int hi=0;hi<7;hi++){ int t=HT[hi]; if(p->hand[side][t]==0)continue;
         if(droppable_at(p,side,t,s)) return 0; } }
   }
   return 1;
 }
 static int use_plus=1;
-/* [S-5] move ordering ゲート。**既定 0 = 無効。実測に基づく判断であり、未実装だからではない。**
- *
- * 経緯: 従来 g_order は宣言と NOORDER 代入の 2 箇所しか無く **read がゼロの死にコード**で、
- * NOORDER は無言の no-op だった = 「ordering は効かない」と結論した過去の実験は何も測って
- * いなかった。そこで実配線し、floodgate 実戦詰み 13 局面 @30s で A/B を取った (2026-07-17):
- *
- *   ordering OFF (既定)                        : **12/13** solved, 157.0s, 111K nps
- *   VARIANT C (旧レンジ[1,9]維持・特徴は±1のみ) : 11/13 solved, 156.7s, 115K nps
- *   VARIANT D (特徴なし・純粋にスケールを拡大)  :  5/13 solved, 260.8s, 139K nps
- *   full (スケール拡大 + 特徴)                  :  3/13 solved, 300.7s, 141K nps
- *
- * 結論: **壊しているのは「特徴」ではなく「seed スケール」**。特徴を一切足さず libs*6 に
- * 広げただけの VARIANT D が 12/13 → 5/13 に崩れる。機構は報告書のハザード 2(a) の通りで、
- * 呼び元は TT hit の子を skip し tt_read_ghi の miss 既定は (1,1) なので、**未 seed / 追い出された
- * 子は常に pn=1 = 最良に見える**。seed を広げるほど「実際に評価した子」が「まだ見ていない子」に
- * 常に負け、選択が壊れて thrash する。nps は上がる (141K > 111K) のに解数は 1/4 — nps を
- * 主指標にしてはならないという実測がここでも再現している。
- * 旧レンジを守った VARIANT C ですら OFF に届かない (11/13 < 12/13) ため、この特徴集合に価値は無い。
- *
- * よって既定 OFF。配線と env は残す — 次に誰かが ordering を試すとき、
- * (i) 土台は既にあり (ii) スケールを広げてはならないことが測定済みだと分かるように。
- * `ORDER=1` で有効化 (実験用)。`NOORDER=1` は互換のため受理 (既定と同じ = 無効)。
- *
- * [S-5b 追試 2026-07-18] TT seed を (1,1) のまま保ち、tie-breaking のみで ordering する
- * 手法も試した。seed の非対称 (= ORDER=1 の根因) は解消したが結果は **11/13** (既定 12/13):
- *   ORDER=2 sort (is_attacked 込み)        : 11/13, 181s, 92K nps
- *   ORDER=2 sort (M_TO-玉 距離のみ)        : 11/13, 179s, 157K nps
- *   ORDER=2 tie-break (距離のみ, ソートなし) : 11/13, 178s, 160K nps (同一探索木)
- * 3 手法とも位置 #9 が 1.9M→13M ノードに退化し timeout に転落。距離ヒューリスティックは
- * 一部の位置で改善 (#6, #10, #13) し別の位置で悪化 (#4, #5, #9, #11) する = 位置依存。
- * **df-pn の tie-breaking は静的ヒューリスティックで安定改善できない**。
- * gen_checks の生成順は (偶然を含め) 既に概ね最善。 */
+
 static int g_order=0;
-static int g_sort=0;    /* ORDER=2: selection tie-break by distance (既定 OFF, 実測により) */
-/* [S-4] df-pn+ の初期推定。**呼び出し時 p は make_move 済みの子局面**で、mv がその手。
- *
- * 誤解しやすい点 (報告書の訂正): 「ordering が無いので argmin は生成順に退化する」は**半分誤り**。
- * estimate は make_move の**後**に呼ばれるので seed は既に事実上 move-dependent であり、
- * OR ノードの argmin は「玉の自由度を最も削る王手」を先に展開している。生成順が効くのは
- * **pn が完全に同値の子の間だけ**。よって真の欠陥は「識別が皆無」ではなく
- *   (i) 分解能が粗い (玉の逃げ場という 1 特徴・0..8 の 9 段階しかない)
- *   (ii) 特徴軸が足りない (支え/取り/近さの情報が無い)
- * の 2 点。ここでは軸を足して分解能を上げる。
- *
- * 数値ハザード (どれか一つ破ると壊れる):
- *  1. **0 を書いてはならない**。first_mate_move は「pn==0 は証明済み詰みのみ (estimate は
- *     0 を書かない)」に依存しており、破ると未証明手を「証明済み」として指す = false mate。
- *  2. **スケールを大きくしてはならない**。(a) 呼び元は TT hit の子を skip し、tt_read_ghi の
- *     miss 既定は (1,1) なので、広いスケールでは「追い出された子」が常に最良に見えて選択が壊れる。
- *     (b) 1+eps 歩行 `thpn<best2+1` は単位粒度を前提としており、粗いスケールでは +1 が no-op 化する。
- *     よって [1, ZY_SEED_MAX=64] にハードクランプする (旧 1..9 から適度に上げるだけ)。
- *  3. g_snda は子の値 > INF/16 を無限扱いするので、その帯に触れてはならない (64 なら遠い)。
- *  4. 反転規約は pn/dn 側で行う (旧実装と同じ)。スコア側で反転すると二重適用になる。
- *
- * g_order=0 (NOORDER=1) で旧実装に**厳密復元**する。これが無いと ordering の A/B が測れない
- * (従来 g_order は read ゼロの死にコードで、NOORDER は無言の no-op だった)。 */
+static int g_sort=0;    
+
 #define ZY_SEED_MAX 64
-static const int ZY_PVAL[15]={0,1,2,2,3,4,5,6,0,3,3,3,3,7,8};  /* 駒種の粗い価値。ptype() 経由で引くこと */
+static const int ZY_PVAL[15]={0,1,2,2,3,4,5,6,0,3,3,3,3,7,8};  
 static void estimate_mv(Pos*p,int mv,int*epn,int*edn){
   int def=g_attacker^1; int ks=p->ksq[def]; if(ks<0){*epn=1;*edn=1;return;}
   int r=RNK(ks),c=COL(ks),libs=0;
   for(int dr=-1;dr<=1;dr++)for(int dc=-1;dc<=1;dc++){ if(!dr&&!dc)continue; int rr=r+dr,cc=c+dc;
     if(!inb(rr,cc))continue; int t=SQ(rr,cc); int pc=p->b[t];
     if(pc==0||pcolor(pc)==g_attacker){ if(!is_attacked(p,t,g_attacker))libs++; } }
-  int e=libs+1;                                   /* 旧実装の値 (1..9) */
+  int e=libs+1;                                   
   if(g_order && mv>=0){
-    /* 玉の自由度を主軸に保ちつつ (支配的), 副次軸で同値を割る。小さいほど「詰みに近い」。*/
-    int s=libs*6;                                 /* 0..48 : 主軸 */
+    
+    int s=libs*6;                                 
     int to=M_TO(mv);
-    /* (a) 王手駒が攻方に支えられているか。支えの無い王手は玉に取られて終わりやすい。*/
+    
     if(!is_attacked(p,to,g_attacker)) s+=3;
-    /* (b) 取った駒。持駒が増えるほど後続の王手が増えるので詰みに近い。
-     *     captured は make_move が積んだ Undo からタダで読める。*/
+    
     { int cap=ustack[usp-1].captured;
       if(cap) { int v=ZY_PVAL[ptype(cap)]; s-= (v>2?2:v); } }
-    /* (c) 玉からの距離 (Chebyshev)。遠い王手は緩みやすい。*/
+    
     { int dr2=RNK(to)-RNK(ks), dc2=COL(to)-COL(ks);
       if(dr2<0)dr2=-dr2; if(dc2<0)dc2=-dc2; int d=dr2>dc2?dr2:dc2;
       s += (d>3?3:d); }
     if(s<0)s=0;
-    e=s+1;                                        /* >=1 を構造的に保証 (ハザード1) */
-    if(e>ZY_SEED_MAX)e=ZY_SEED_MAX;               /* ハザード2 */
+    e=s+1;                                        
+    if(e>ZY_SEED_MAX)e=ZY_SEED_MAX;               
   }
   if(p->side==g_attacker){*epn=1;*edn=e;} else {*epn=e;*edn=1;}
 }
-/* [S-5b] Sort-only quality score. Same features as estimate_mv but:
- * (1) always computes features (independent of g_order),
- * (2) returns a sort key instead of writing pn/dn seeds to TT.
- * Lower = more promising for attacker. Called after make_move. */
+
 static int move_quality(Pos*p,int mv){
   int def=g_attacker^1; int ks=p->ksq[def];
   if(ks<0) return 0;
@@ -1055,103 +892,62 @@ static int move_quality(Pos*p,int mv){
   return s;
 }
 
-/* df-pn MID. 返り値は使わない(置換表に格納)。*/
-/* ===== 固定深さ mate_search (dlshogi着想, mate3を一般化) =====
-   ORノード(攻方手番)から depth 手以内に詰むか。千日手は on_path、打歩詰は gen_checks で整合。 */
+
+
 #ifndef MFD
 #define MFD 3
 #endif
-static int g_mfd=MFD; static int g_nodelay=0; static int g_snda=1;   /* 固定深さmate探索の深さ(実行時可変, 既定3) */
+static int g_mfd=MFD; static int g_nodelay=0; static int g_snda=1;   
 static int mate_and(Pos*p,int depth);
-/* [S-1] 王手リストを呼び元から借りる版。mid は自分で gen_checks(p,moves) した直後に
- * これを呼ぶので、同一局面での二重生成 (旧 mate_search の第1文) を避けられる。
- * cm は値のコピー配列なので、内部の make_move/unmake_move の影響を受けない。 */
-static int mate_search_with(Pos*p,int depth,const int*cm,int n){   /* OR: depth は奇数 */
+
+static int mate_search_with(Pos*p,int depth,const int*cm,int n){   
   for(int i=0;i<n;i++){ make_move(p,cm[i]); int r;
-    if(on_path(p->key)) r=0;                   /* 攻方が千日手に入る手は不可 */
-    else { if(is_mated(p)) r=1;                 /* [S-1] 旧: gen_legal をフル生成して nd==0 だけ見ていた */
+    if(on_path(p->key)) r=0;                   
+    else { if(is_mated(p)) r=1;                 
       else if(depth<=1) r=0;
       else { g_path[g_pathlen++]=p->key; r=mate_and(p,depth-1); g_pathlen--; } }
-    /* [S-2] 証明できた子 (AND節点) を TT に残す。旧実装は「その節点1つ」だけを
-     * mid 側で書き、歩いた木を丸ごと捨てていた。mid は mate_search が成功すると
-     * 子ループ (estimate/ck[] を埋める箇所) より**前に return する**ため、
-     * 3手詰 probe で証明された root の子は誰も TT エントリを持たず、
-     * first_mate_move (子に tt_read して pn==0 を探す) が miss 既定の (1,1) を見て
-     * **-1 を返す** = 初手が取れない。中盤の短い詰み = MateWorker の主用途で
-     * 構造的に壊れていた。ここで子を書けば穴が塞がる。
-     * 健全性: r==1 は「is_mated (受け方に合法手なし)」か「mate_and が全逃れ手を
-     * 潰した」のいずれかで、どちらも有限深さの強制詰みの証明。on_path は
-     * mate_search/mate_and では**棄却にしか使われない** (攻方の千日手手を捨て、
-     * 受け方の千日手逃れを「逃れ」に倒す) ので判定は経路非依存であり、
-     * mid が同じ値を root について既に tt_store しているのと同じ資格で安全。 */
-    if(r){ tt_store(p->key,0,INF); twin_remove(p->key); }   /* [S-2] 証明は無条件: 既存 twin を除去し finalize_ghi と揃える */
+    
+    if(r){ tt_store(p->key,0,INF); twin_remove(p->key); }   
     unmake_move(p); if(r) return 1; }
   return 0; }
-/* 呼び元が王手リストを持たない場合 (mate_and からの再帰) 用のラッパ。
- * 注: 報告書は「mate_search の唯一の呼び元は mid」としていたが誤りで、
- * mate_and も mate_search を再帰呼び出しする。よってこのラッパは必須。 */
+
 static int mate_search(Pos*p,int depth){
   int cm[MAXMOVES]; int n=gen_checks(p,cm); return mate_search_with(p,depth,cm,n); }
-static int mate_and(Pos*p,int depth){          /* AND: p=受け方手番 */
+static int mate_and(Pos*p,int depth){          
   int dm[MAXMOVES]; int nd=gen_legal(p,dm);
-  /* [S-2] ここも証明済み終端 (受け方に合法手なし=詰み) なので TT に残す。mid の
-   * `else { nm=gen_legal(...); if(nm==0){tt_store(key,0,INF);...} }` と同一の資格。
-   * 注: mate_and の**失敗** (return 0) は深さ制限に依存するので (INF,0) として
-   * 書いてはならない — 「深さ3で詰まない」は「詰まない」ではない。書くのは勝ち側だけ。*/
-  if(nd==0){ tt_store(p->key,0,INF); twin_remove(p->key); return 1; }  /* [S-2] 既に詰み。twin も除去 */
+  
+  if(nd==0){ tt_store(p->key,0,INF); twin_remove(p->key); return 1; }  
   if(depth<=0) return 0;
   for(int j=0;j<nd;j++){ make_move(p,dm[j]); int r;
-    if(on_path(p->key)) r=0;                    /* 受け方が千日手で逃げた */
+    if(on_path(p->key)) r=0;                    
     else { g_path[g_pathlen++]=p->key; r=mate_search(p,depth-1); g_pathlen--; }
-    /* [S-2] 証明できた OR 節点も残す (mate_search_with の AND 側の store と対称)。
-     * これが無いと probe 由来の証明木は AND→OR で鎖が切れる: mid が root(OR) を、
-     * mate_search_with が子 C(AND) を、その先の mate_search_with が E(AND) を書く一方で、
-     * 間の OR 節点 D だけが未格納になり、TT だけを辿る証明木の走査が成立しない。
-     * 健全性は mate_search_with 側と同じ (r==1 は有限深さの強制詰みの証明で経路非依存)。*/
-    if(r){ tt_store(p->key,0,INF); twin_remove(p->key); }   /* [S-2] 証明は無条件: twin 除去 */
-    unmake_move(p); if(!r) return 0; }          /* 一つでも逃れがあれば不詰 */
+    
+    if(r){ tt_store(p->key,0,INF); twin_remove(p->key); }   
+    unmake_move(p); if(!r) return 0; }          
   return 1; }
-/* 固定深さ探索を試した節点の記録(初回のみ実行) */
-/* 3手詰を試した節点の記録(初回のみ実行) */
+
+
 #define M3BITS 22
 #define M3SIZE (1<<M3BITS)
 #define M3MASK (M3SIZE-1)
-/* m3_key, m3_gen: ZCtx */
+
 static void m3_init(){ if(!m3_key){ ZMALLOC(m3_key,sizeof(uint64_t)*M3SIZE,"m3_key"); ZCALLOC(m3_gen,M3SIZE,sizeof(uint32_t),"m3_gen");} }
 static int m3_seen(uint64_t k){ int i=k&M3MASK; for(int j=0;j<6;j++){int x=(i+j)&M3MASK; if(m3_gen[x]==g_gen&&m3_key[x]==k)return 1;} return 0; }
 static void m3_add(uint64_t k){ int i=k&M3MASK,slot=-1,fr=-1; for(int j=0;j<6;j++){int x=(i+j)&M3MASK; if(m3_gen[x]==g_gen){if(m3_key[x]==k){slot=x;break;}} else if(fr<0)fr=x;} if(slot<0)slot=(fr>=0?fr:i&M3MASK); m3_gen[slot]=g_gen;m3_key[slot]=k; }
-/* [FIX-DEPTH-GUARD] 深さの上限が存在しなかった。g_path[4096] (:373) は :694 で、
- * ustack[4096] (:240) は make_move で、どちらも**境界検査なし**に書かれるため、
- * 十分深い df-pn 降下は静かにメモリを壊す。加えて mid() の 1 フレームは実測 19,074B
- * (moves/ck/repf/dly/gnx/rep_targets) で、2MB スタック予約なら ~108 手で踏み抜く。
- * ここで打ち切れば、残余のオーバーフローは「クラッシュ/沈黙の破壊」から「unknown を
- * 返す」に降格する (longjmp 先は solve の setjmp = 予算切れと同じ扱い)。
- * g_pathlen は再帰深さそのもの (solve が root を push し、各段が 1 個 push する)
- * なので depth 引数は不要で、usp も同深度で動くため 1 個のガードで両方カバーできる。
- * 3900 は g_path[4096] を守る値。スタック側は build.bat の -Wl,--stack で
- * 3900*19KB=74MB を賄う (下記 ZYF_MAX_DEPTH のコメント参照)。 */
+
 #define ZYF_MAX_DEPTH 3900
-/* [ZYF-TREE 2026-10-05] Optional per-thread proof export (Cyf_Zyf_Tree_Share): each OR node mid() proves, with the
- * proving move, in the search's key/move domain. Off (null) costs one pointer test per finished OR node. Proofs are
- * unconditional here (finalize_ghi), so a proven subtree of an unknown or disproved root is still a proof. */
+
 static __thread std::vector<std::pair<uint64_t,uint16_t>>* g_yexport=nullptr; static __thread size_t g_yexport_cap=0;
-/* [ZYF-TREE-LIVE 2026-10-05] Optional live publication: called with each proven OR node as mid() proves it, so the
- * search can use a proof tree while Zyfamate is still solving (Cyf_Zyf_Tree_Live). */
+
 static __thread void (*g_ylive)(uint64_t,uint16_t)=nullptr;
 static void move_usi(int m,char*buf);
 #if defined(ZYFAMATE_HOST_YANEURAOU)
 static inline uint16_t yo_move16(int m){ char buf[8]={0}; move_usi(m,buf); return YaneuraOu::USIEngine::to_move16(buf).to_u16(); }
 #else
-static inline uint16_t yo_move16(int){ return 0; }   /* standalone: proof-tree export has no consumer */
+static inline uint16_t yo_move16(int){ return 0; }   
 #endif
 static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
-  /* [EMBED-PARITY] g_stop を直列 mid() でも honor する。従来これは cyfamate.cpp の
-   * 埋め込みコピー側にだけ手作業で当てられていた差分で、Zyfamate.c 本体には無かった
-   * (= 逐語コピーではなかった)。埋め込みエンジンは MateWorker::stop_join() が g_stop=1 を
-   * 立てて worker を止めるため、これが無いと直列探索を中断できない。
-   * SEAL-PARALLEL により Cyf_Mate_Threads>1 も mid_par ではなく mid を通るようになったので、
-   * 本体側に取り込んで差分を消す。standalone では g_stop を 1 にするのは pworker の完了時のみで、
-   * その後 mid() を呼ぶ経路は無いため無害 (solve_parallel は自前で g_stop=0 してから起動する)。*/
+  
   if((++g_nodes & g_poll_mask)==0){ if(g_stop||g_nodes>g_limit||now()-g_t0>g_tlimit){ g_stop_reason=g_stop?3:(g_nodes>g_limit?1:2); longjmp(g_jmp,1); }
     if(g_usi_mode){ double t=now()-g_t0; if(t-g_usi_last_info>=1.0){
       g_usi_last_info=t; long nps=t>0?(long)(g_nodes/t):0;
@@ -1164,40 +960,31 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
   int is_or=(p->side==g_attacker);
   int moves[MAXMOVES]; int nm;
   if(is_or){ nm=gen_checks(p,moves); if(nm==0){tt_store(key,INF,0); twin_remove(key); if(use_superior)sup_rec(nomate_tab,p->bkey,A,D); return 0;}
-    /* [S-1] 直前に生成した moves/nm をそのまま渡し、mate_search 内の重複 gen_checks を省く。*/
+    
     if(!m3_seen(key)){ m3_add(key); if(mate_search_with(p,g_mfd,moves,nm)){ tt_store(key,0,INF); twin_remove(key); if(use_superior)sup_rec(proof_tab,p->bkey,A,D); return 0; } } }
   else { nm=gen_legal(p,moves); if(nm==0){tt_store(key,0,INF); twin_remove(key); if(use_superior)sup_rec(proof_tab,p->bkey,A,D); return 0;} }
 
   uint64_t ck[MAXMOVES]; uint8_t repf[MAXMOVES];
-  /* [ZYF-TT-PREFETCH] Issue every child's TT probe before the first one is read so the misses overlap. */
+  
   for(int i=0;i<nm;i++){ ck[i]=child_key(p,moves[i]); tt_prefetch(ck[i]); }
   for(int i=0;i<nm;i++){ make_move(p,moves[i]); assert(ck[i]==p->key); ck[i]=p->key;
     if(use_plus && tt_find(p->key)<0 && twin_find(p->key)<0){int ep,ed;estimate_mv(p,moves[i],&ep,&ed);tt_store(p->key,ep,ed);}
     repf[i]=0; unmake_move(p); }
 
-  uint8_t dly[MAXMOVES]; int gnx[MAXMOVES];                 /* 合駒の遅延展開(KomoringHeights着想) */
+  uint8_t dly[MAXMOVES]; int gnx[MAXMOVES];                 
   for(int i=0;i<nm;i++){ dly[i]=0; gnx[i]=-1; }
-  if(!is_or && !g_nodelay){                          /* 同升合駒は連続生成なのでO(nm)で群化 */
+  if(!is_or && !g_nodelay){                          
     int head=-1,tail=-1;
     for(int i=0;i<nm;i++){
       if(IS_DROP(moves[i])){
         if(head>=0 && M_TO(moves[i])==M_TO(moves[head])){ gnx[tail]=i; dly[i]=1; tail=i; }
         else { head=i; tail=i; }
       } else head=-1; } }
-  uint64_t rep_targets[64]; int rtn=0;   /* この節点の不詰が依存する祖先key集合 */
+  uint64_t rep_targets[64]; int rtn=0;   
 
   for(;;){
     int pn,dn,best=-1,best1=INF,best2=INF;
-    /* [FIX-LLP64] 累算は int64_t で行う。Windows(LLP64) の long は 32bit であり
-     * (本機 gcc 16.1.0 ucrt64 で sizeof(long)=4 を実測)、`dd>INF?INF:(int)dd` の
-     * 飽和ガードは「正の大値」しか捕まえられない — 符号付きオーバーフローは負に
-     * 折り返るため、ガードをすり抜けて pn/dn が負になる。負の pn は pn>=thpn を
-     * 偽にし、repf 子由来の dn==0 が dn>=thdn も偽にするため脱出条件が発火せず、
-     * make_move→on_path→repf[best]=1→continue のループは g_nodes も時計も
-     * 触らない (それらの検査は mid() 入口にしかない) = タイムアウト脱出不能の
-     * 無限ループになる。既定 g_snda=1 は各項を <=INF/16 に抑えるため 128 子以上
-     * 必要で実質到達不能だが (実測の最大和は 2.68e8 で INT32_MAX の 1/8)、
-     * NOSNDA=1 では上限が消え INF の子 9 個で溢れる。int64_t なら構造的に不可能。*/
+    
     if(is_or){ pn=INF; int64_t dnsum=0; int dnmax=0; int best_d=99;
       int kr=-1,kc=-1; if(g_sort){int ks=p->ksq[g_attacker^1]; if(ks>=0){kr=RNK(ks);kc=COL(ks);}}
       for(int i=0;i<nm;i++){int cpn,cdn; if(repf[i]){cpn=INF;cdn=0;}else tt_read_ghi(ck[i],&cpn,&cdn);
@@ -1219,7 +1006,7 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
           if(gnx[i]>=0 && cpn==0 && dly[gnx[i]]){ dly[gnx[i]]=0; act=1; } } }
       { int64_t pp=pnsum+pnmax; pn=pp>INF?INF:(int)pp; }
       int anyd=0; for(int i=0;i<nm;i++) if(dly[i]){anyd=1;break;}
-      if(anyd && pn<INF) pn+=1;                       /* 残遅延あり→半無限ループ回避 */
+      if(anyd && pn<INF) pn+=1;                       
     }
     if(pn==0 && is_or && g_yexport && best>=0 && g_yexport->size()<g_yexport_cap){
       g_yexport->emplace_back(yo_key(p),yo_move16(moves[best]));
@@ -1242,12 +1029,12 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
   }
 }
 
-/* ===== 並列df-pn(共有TT + virtual proof/disproof number, GPS金子2010の正攻法) ===== */
+
 static pthread_mutex_t g_mtx=PTHREAD_MUTEX_INITIALIZER;
 static void ttp_read(uint64_t k,int*pn,int*dn){ pthread_mutex_lock(&g_mtx); tt_read(k,pn,dn); pthread_mutex_unlock(&g_mtx); }
 static void ttp_store(uint64_t k,int pn,int dn){ pthread_mutex_lock(&g_mtx); tt_store(k,pn,dn); pthread_mutex_unlock(&g_mtx); }
 static int  ttp_has(uint64_t k){ pthread_mutex_lock(&g_mtx); int r=tt_find(k)>=0; pthread_mutex_unlock(&g_mtx); return r; }
-/* working-count テーブル(virtual loss): key -> いまその部分木を探索中のスレッド数 */
+
 #define WKSIZE (1<<21)
 #define WKMASK (WKSIZE-1)
 static uint64_t *wk_key=NULL; static int *wk_cnt; static uint8_t *wk_used;
@@ -1259,10 +1046,10 @@ static void wk_dec(uint64_t k){ pthread_mutex_lock(&g_mtx); int i=k&WKMASK; for(
 static int  wk_get(uint64_t k){ pthread_mutex_lock(&g_mtx); int i=k&WKMASK; int r=0; for(int j=0;j<16;j++){int x=(i+j)&WKMASK;
   if(!wk_used[x])break; if(wk_key[x]==k){r=wk_cnt[x];break;}} pthread_mutex_unlock(&g_mtx); return r; }
 
-/* virtual値は子選択の誘導のみに使用。終端/勝敗/閾値判定は実値(real)で行う=健全 */
+
 static void mid_par(Pos*p,int thpn,int thdn,int*outrep){
   if((++g_nodes & std::min(g_poll_mask,4095u))==0){ if(g_stop||g_nodes>g_limit||now()-g_t0>g_tlimit){ g_stop_reason=g_stop?3:(g_nodes>g_limit?1:2); longjmp(g_jmp,1); } }
-  if(g_pathlen>=ZYF_MAX_DEPTH){ g_stop_reason=4; longjmp(g_jmp,1); }   /* [FIX-DEPTH-GUARD] mid と同じ */
+  if(g_pathlen>=ZYF_MAX_DEPTH){ g_stop_reason=4; longjmp(g_jmp,1); }   
   uint64_t key=p->key; int rep_here=0;
   int is_or=(p->side==g_attacker);
   int moves[MAXMOVES]; int nm;
@@ -1307,22 +1094,21 @@ static void mid_par(Pos*p,int thpn,int thdn,int*outrep){
 
 static int solve(Pos*p,long nodelimit,double tlimit,long*nodes_out){
   g_attacker=p->side; tt_init(); twin_init(); m3_init(); if(use_superior)sup_init(); g_stop_reason=0;
-  g_poll_mask = tlimit <= 0.02 ? 63u : tlimit <= 0.05 ? 255u : tlimit <= 0.25 ? 1023u : 8191u;   /* [TM-FAST 2026-10-08] a <=20 ms solve polls the clock every 64 nodes */
+  g_poll_mask = tlimit <= 0.02 ? 63u : tlimit <= 0.05 ? 255u : tlimit <= 0.25 ? 1023u : 8191u;   
   if(++g_gen==0 || g_gen==PROOF_GEN){ tt_clear_gen(); memset(m3_gen,0,sizeof(uint32_t)*M3SIZE);
     if(proof_tab){sup_clear(proof_tab);sup_clear(nomate_tab);} g_gen=1; } g_nodes=0; g_limit=nodelimit; g_t0=now(); g_tlimit=tlimit; g_pathlen=0;
   int usp_save=usp;
-  if(setjmp(g_jmp)){ usp=usp_save; if(nodes_out)*nodes_out=g_nodes; return 2; } /* unknown */
+  if(setjmp(g_jmp)){ usp=usp_save; if(nodes_out)*nodes_out=g_nodes; return 2; } 
   g_path[g_pathlen++]=p->key;
   { uint64_t rt[16]; mid(p,INF,INF,rt); }
-  g_pathlen=0;                 /* 経路をクリア(以降のon_path利用を汚さない) */
+  g_pathlen=0;                 
   if(nodes_out)*nodes_out=g_nodes;
   int pn,dn; tt_read_ghi(p->key,&pn,&dn);
   if(pn==0)return 1; if(dn==0)return 0; return 2;
 }
 
 typedef struct { const char*sfen; long nodes; } PArg;
-/* キャストは C++ 埋め込み互換のため (C では不要だが有害でもない)。cyfamate.cpp の
- * 埋め込みコピーは既に手作業で (PArg*) を足しており、ここで合わせると逐語コピーに近づく。*/
+
 static void* pworker(void*arg){ PArg*a=(PArg*)arg; Pos p; parse_sfen(&p,a->sfen); g_nodes=0;
   if(setjmp(g_jmp)){ a->nodes=g_nodes; return NULL; }
   g_pathlen=0; g_path[g_pathlen++]=p.key; int rep=0;
@@ -1330,20 +1116,7 @@ static void* pworker(void*arg){ PArg*a=(PArg*)arg; Pos p; parse_sfen(&p,a->sfen)
   g_stop=1; a->nodes=g_nodes; return NULL; }
 static int solve_parallel(const char*sfen,int nthreads,long nl,double tl,long*nodes_out){
   Pos p; if(!parse_sfen(&p,sfen)){ if(nodes_out)*nodes_out=0; return 2; }
-  /* [SEAL-PARALLEL] 既定では直列 solve() に委譲する。**この関数の中で封じるのが要点**で、
-   * cyfamate.cpp:33496 が `if (nthreads > 1) r = Zyfamate::solve_parallel(...)` と
-   * ここを直接呼ぶため (Cyf_Mate_Threads は USI option で 1..64)、main() 側の CLI 引数を
-   * 潰すだけでは実機エンジンを保護できない。
-   * 根拠 (実測 2026-07-17, 16コア, 合計ノード数/5秒):
-   *   threads: 1=1,388,544 / 2=827,392 / 4=827,392 / 8=647,168 / 16=970,752
-   *   → 2スレッドで 0.60x、16スレッドでも 0.70x。「スケールしない」ではなく**純損**。
-   * 機構: g_mtx が単一グローバルで、ttp_read と wk_get を子選択ループの毎周・子ごとに
-   * 2 回取る。クリティカルセクションは数 ns の配列 probe なので mutex 往復に埋没する。
-   * さらに mid_par は mid の陳腐化したフォークで、固定深さ mate_search (実測で 12/13 の
-   * 主役)・優越関係・GHI/twin を**どれも持たない** → 経路依存の不詰を無条件 nomate として
-   * 共有 TT に書く (false nomate)。つまり並列は速度でも健全性でも直列に劣る。
-   * よって委譲先は「nthreads=1 の mid_par」ではなく **solve() (= mid)** にする。
-   * これにより Cyf_Mate_Threads>1 は「遅くて不健全な並列」から「速くて健全な直列」に化ける。*/
+  
   if(nthreads<=1 || !getenv("ZYFAMATE_ALLOW_PARALLEL")){
     if(nthreads>1) fprintf(stderr,"info string Zyfamate: parallel df-pn is a measured net loss "
         "(0.60x at 2T) and mid_par lacks mate_search/superiority/GHI; using the serial solver. "
@@ -1351,9 +1124,7 @@ static int solve_parallel(const char*sfen,int nthreads,long nl,double tl,long*no
     return solve(&p,nl,tl,nodes_out);
   }
   g_attacker=p.side; g_limit=nl; g_t0=now(); g_tlimit=tl; g_stop=0;
-  /* [FIX-TWIN-NULL] twin_init() を追加。solve_parallel 単独経路では tw_used が NULL の
-   * まま can_mate/mate_length が twin_find に到達し得た (twin_find 側でも塞いだが、
-   * 表そのものを用意しておく方が将来 mid_par に GHI を移植するときの前提になる)。 */
+  
   int save_sup=use_superior; use_superior=0; g_parallel=1; tt_init(); twin_init(); wk_init();
   if(++g_gen==0 || g_gen==PROOF_GEN){ tt_clear_gen(); g_gen=1; }
   if(nthreads<1)nthreads=1; if(nthreads>64)nthreads=64;
@@ -1363,72 +1134,53 @@ static int solve_parallel(const char*sfen,int nthreads,long nl,double tl,long*no
   g_parallel=0; use_superior=save_sup; if(nodes_out)*nodes_out=tot;
   int pn,dn; tt_read(p.key,&pn,&dn); return pn==0?1:(dn==0?0:2); }
 
-/* ---- exact mate length (iterative deepening + (key,remaining) memo) ---- */
+
 #define LMBITS 22
 #define LMSIZE (1<<LMBITS)
 #define LMMASK (LMSIZE-1)
-/* lm_key, lm_val, lm_used, lm_nodes, lm_limit, lm_jmp: ZCtx */
-/* [FIX-MATELEN-STOP] 1=mate_length (長い/中断可) / 0=print_pv (短い/予算内で完走)。
- * can_mate は両方から使われるので、どちらの文脈かをこれで区別する。 */
-/* lm_honor_stop: ZCtx */
-/* lm_deadline: ZCtx (0 = no wall-clock limit for mate length / PV formatting) */
+
+
+
+
 static void lm_init(){ if(!lm_key){ ZMALLOC(lm_key,sizeof(uint64_t)*LMSIZE,"lm_key"); ZMALLOC(lm_val,LMSIZE,"lm_val"); ZMALLOC(lm_used,LMSIZE,"lm_used");} memset(lm_used,0,LMSIZE); }
 static int lm_get(uint64_t h,int*v){int i=h&LMMASK;for(int j=0;j<6;j++){int x=(i+j)&LMMASK;
   if(!lm_used[x])return 0; if(lm_key[x]==h){*v=lm_val[x];return 1;}}return 0;}
 static void lm_put(uint64_t h,int v){int i=h&LMMASK;int slot=-1;for(int j=0;j<6;j++){int x=(i+j)&LMMASK;
   if(!lm_used[x]||lm_key[x]==h){slot=x;break;}} if(slot<0)slot=i; lm_used[slot]=1;lm_key[slot]=h;lm_val[slot]=v;}
 
-/* ===== [PHASE5] TT proof-walk による手数取得 =====
- * 動機 (実測): mate_length は d=1,3,5,... の反復深化で**ゼロから再探索**するため実戦局面では
- * 10 秒でも終わらず、MFD=3 の 12 解のうち 9 件が "mate ?" になっていた。埋め込み側は
- * 予算 0.5 秒しか与えられないので事実上**必ず**失敗し、L=-1 → len=0 → cyfamate が
- * 「score mate 1」と誤報していた (floodgate #4 は実際 ~20手)。
- *
- * 一方 df-pn は既に証明を TT に持っている。[S-2] で mate_search/mate_and が証明した連鎖も
- * 書き戻すようにしたので、**証明済み節点は TT を辿るだけで列挙できる**。再探索は要らない。
- *
- * 意味論 (重要): 返すのは「実際に到達可能な詰み手順の長さ」= **上界**であって、
- * can_mate が返す**厳密最小ではない**。OR 節点で pn==0 の子を 1 つ選んで進むため。
- * 手数を過大申告するのは安全側 (過小申告は「もっと早く詰む」と嘘をつくことになり危険)。
- * 厳密最小が要る用途 (tsume CLI) は従来どおり mate_length を使う。
- *
- * 健全性: 参照するのは pn==0 の節点のみ = 証明済みのみ。estimate は 0 を書かない
- * (first_mate_move が依存している不変条件と同じ)。証明は経路非依存なので memo は key のみで良い。
- * 証明が TT に無い節点 (sup_mate ヒットで子を残していない等) に当たったら -1 を返して
- * 呼び元が mate_length にフォールバックする。 */
+
 #define PW_UNKNOWN 255
 static int mate_len_tt(Pos*p,int cap){
   CYF_ZYF_TEST_STAGE(2);
-  // Unwind through ordinary returns so each made move is restored on cancellation.
+  
   if(g_stop || (lm_deadline>0 && now()>=lm_deadline)) return -1;
   if(cap<0) return -1;
-  /* memo: can_mate の h=key^(K*(rem+1)) と衝突しない別定数を使う (rem>=0 なので K*0 は未使用)。*/
+  
   uint64_t h=p->key ^ 0xD6E8FEB86659FD93ULL;
   int v; if(lm_get(h,&v)) return v==PW_UNKNOWN?-1:v;
   int is_or=(p->side==g_attacker); int res;
   if(!is_or){
     int mv[MAXMOVES]; int n=gen_legal(p,mv);
-    if(n==0){ lm_put(h,0); return 0; }              /* 受け方に合法手なし = 既に詰み */
-    if(cap==0) return -1;   /* [PHASE5] cap 依存の打ち切りは memo しない (memo は position 鍵のみ) */
+    if(n==0){ lm_put(h,0); return 0; }              
+    if(cap==0) return -1;   
     int worst=-1;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int pn,dn; tt_read(p->key,&pn,&dn);
       int r=(pn==0)?mate_len_tt(p,cap-1):-1; unmake_move(p);
-      if(r<0){ lm_put(h,PW_UNKNOWN); return -1; }   /* 一つでも証明が欠けたら辿れない */
-      if(r>worst)worst=r; }                          /* 受け方は最長を選ぶ */
+      if(r<0){ lm_put(h,PW_UNKNOWN); return -1; }   
+      if(r>worst)worst=r; }                          
     res=1+worst;
   } else {
-    if(cap==0) return -1;   /* [PHASE5] cap 依存の打ち切りは memo しない (memo は position 鍵のみ) */
+    if(cap==0) return -1;   
     int mv[MAXMOVES]; int n=gen_checks(p,mv); res=-1;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int pn,dn; tt_read(p->key,&pn,&dn);
       int r=(pn==0)?mate_len_tt(p,cap-1):-1; unmake_move(p);
-      if(r>=0){ res=1+r; break; } }                  /* 攻方は証明済みの子を 1 つ選べば良い */
+      if(r>=0){ res=1+r; break; } }                  
     if(res<0){ lm_put(h,PW_UNKNOWN); return -1; }
   }
   if(res>=0 && res<PW_UNKNOWN) lm_put(h,res);
   return res;
 }
-/* 証明済み局面の手数を返す。まず TT proof-walk (O(証明木), 再探索なし) を試し、
- * 証明が TT に残っていなければ従来の反復深化 mate_length にフォールバックする。 */
+
 static int mate_length(Pos*p,int maxd,double budget_s);
 static int mate_len_fast(Pos*p,int maxd,double budget_s){
   lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=1;
@@ -1439,16 +1191,9 @@ static int mate_len_fast(Pos*p,int maxd,double budget_s){
     g_pathlen=saved;
     if(L>0) return L;
   } else g_pathlen=saved;
-  return mate_length(p,maxd,budget_s);   /* 証明が辿れなかった: 従来法へ */
+  return mate_length(p,maxd,budget_s);   
 }
-/* [PHASE5] 埋め込み (MateWorker) 用の再探索なし・即答版。
- * TT proof-walk のみ。証明が辿れれば厳密手数、辿れなければ (sup_mate/mate_search 由来の
- * 行き止まり) -1 を返す。呼び元 (cyfamate) は -1 を「詰みだが手数不明/長い」として
- * mate_in(MAX_PLY-1) で扱う — 手数の**過小申告は危険** (より緊急に見える) だが
- * 過大申告は安全なので、不明時は大きい手数に倒すのが正しい。
- * mate_length に落ちないので stop_join のブロック時間を気にせず呼べる (常に O(証明木))。
- * static でよい: 埋め込みでは同一 TU なので Zyfamate::mate_len_proof で参照できる
- * (mate_length 等と同じ。非 static シンボルを増やさない = 埋め込みガイドラインの不変条件)。 */
+
 static int mate_len_proof(Pos*p,int cap,double budget_s=0){
   lm_init(); lm_nodes=0; lm_limit=20000000; lm_honor_stop=1;
   lm_deadline=budget_s>0 ? now()+budget_s : 0;
@@ -1459,36 +1204,23 @@ static int mate_len_proof(Pos*p,int cap,double budget_s=0){
   return L>0?L:-1;
 }
 
-/* rem手以内に攻方が詰ませられるか。探索本体(mate_search/mate_and)と同じ千日手
- * セマンティクスで判定: 攻方が経路上の局面に戻る手は進展なし(不可)、受方が経路上に
- * 戻る手は逃れ。*rep_out には「この結果が千日手判定に依存したか」を返す。
- * memoは千日手非依存の結果のみ格納(GHIによる誤キャッシュを回避する保守的方針)。 */
+
 static int can_mate(Pos*p,int rem,int*rep_out){
   CYF_ZYF_TEST_STAGE(4);
   if(lm_honor_stop && (g_stop || (lm_deadline>0 && now()>=lm_deadline))) longjmp(lm_jmp,1);
   *rep_out=0;
-  /* [FIX-MATELEN-STOP] 手数測定 (mate_length) だけ g_stop を honor する。
-   * 動機: mate_length は中断不能だったため、埋め込み側の stop_join() のブロック時間が
-   * そのまま mate_length の予算になっていた。time loss を恐れて MateWorker は予算を
-   * 0.5 秒に絞り、その結果**実戦局面ではほぼ必ず手数測定が失敗**して L=-1 → len=0 に潰れ、
-   * cyfamate 側が「score mate 1」と誤報していた (実測: floodgate #4 は実際 ~20手)。
-   * g_stop を見るようにすれば長い予算を与えても stop_join は即座に戻れる。
-   *
-   * ただし print_pv には honor させない (lm_honor_stop=0)。stop_join は g_stop=1 を
-   * 立ててから join するので、print_pv まで g_stop を見ると「証明済みなのに初手を
-   * 再構築できず override が発火しない」= 証明を捨てることになる。print_pv は元々
-   * 0.3 秒の予算で回っており、その分の stop 遅延は変更前から存在したもの。 */
+  
   if((++lm_nodes & 16383)==0){
     if((lm_honor_stop&&g_stop)||lm_nodes>lm_limit||(lm_deadline>0&&now()>lm_deadline)) longjmp(lm_jmp,1); }
   uint64_t h=p->key ^ (0x9E3779B97F4A7C15ULL*(uint64_t)(rem+1));
-  int v; if(lm_get(h,&v))return v;              /* memoは千日手非依存の結果のみ */
+  int v; if(lm_get(h,&v))return v;              
   int is_or=(p->side==g_attacker); int res, subrep=0;
   if(is_or){
     if(rem<=0){lm_put(h,0);return 0;}
     int pn,dn; tt_read(p->key,&pn,&dn); if(dn==0&&pn>=INF&&twin_find(p->key)<0){lm_put(h,0);return 0;}
     int mv[MAXMOVES]; int n=gen_checks(p,mv); res=0;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int r;
-      if(on_path(p->key)){ r=0; *rep_out=1; }    /* 攻方が千日手に入る手は進展なし */
+      if(on_path(p->key)){ r=0; *rep_out=1; }    
       else { int cr=0; g_path[g_pathlen++]=p->key; r=can_mate(p,rem-1,&cr); g_pathlen--; subrep|=cr; }
       unmake_move(p); if(r){res=1;break;} }
   } else {
@@ -1497,16 +1229,15 @@ static int can_mate(Pos*p,int rem,int*rep_out){
     int pn,dn; tt_read(p->key,&pn,&dn); if(dn==0&&pn>=INF&&twin_find(p->key)<0){lm_put(h,0);return 0;}
     res=1;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int r;
-      if(on_path(p->key)){ r=0; *rep_out=1; }    /* 受方が千日手で逃れる */
+      if(on_path(p->key)){ r=0; *rep_out=1; }    
       else { int cr=0; g_path[g_pathlen++]=p->key; r=can_mate(p,rem-1,&cr); g_pathlen--; subrep|=cr; }
       unmake_move(p); if(!r){res=0;break;} }
   }
   int rep_involved = (*rep_out) | subrep; *rep_out = rep_involved;
-  if(!rep_involved) lm_put(h,res);              /* 千日手非依存のみキャッシュ */
+  if(!rep_involved) lm_put(h,res);              
   return res;
 }
-/* budget_s>0 なら壁時計でも打ち切る (詰み結果を握ったままプロセスが親のtimeoutで
- * 殺され「発見済みの詰みが無音で失われる」事故を構造的に排除するため)。 */
+
 static int mate_length(Pos*p,int maxd,double budget_s){
   lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=1;
   lm_deadline = budget_s>0 ? now()+budget_s : 0;
@@ -1523,14 +1254,14 @@ static int node_dist(Pos*p,int cap){
   g_pathlen=saved; return r;
 }
 
-/* USI move string */
+
 static const char* CSAN[15]={"","FU","KY","KE","GI","KI","KA","HI","OU","TO","NY","NK","NG","UM","RY"};
 static void move_csa(Pos*p,int m,int col,char*buf){
   int to=M_TO(m),tf=9-COL(to),tr=RNK(to)+1; char sg=col==BLACK?'+':'-';
   if(IS_DROP(m)) sprintf(buf,"%c00%d%d%s",sg,tf,tr,CSAN[M_DROP(m)]);
   else{ int f=M_FROM(m),ff=9-COL(f),fr=RNK(f)+1,mt=ptype(p->b[f]),nt=M_PROMO(m)?PROMO[mt]:mt;
     sprintf(buf,"%c%d%d%d%d%s",sg,ff,fr,tf,tr,CSAN[nt]); } }
-/* USI format: "7g7f" (board move), "7a7b+" (promote), "G*5b" (drop) */
+
 static void move_usi(int m,char*buf){
   int to=M_TO(m); char tf='1'+(8-COL(to)),tr='a'+RNK(to);
   if(IS_DROP(m)){ static const char DP[]="?PLNSGBR";
@@ -1543,17 +1274,14 @@ static int parse_usi_move(Pos*p,const char*s){
   for(int i=0;i<nm;i++){ char buf[8]; move_usi(mv[i],buf); if(!strcmp(buf,s)) return mv[i]; }
   return -1; }
 
-/* PV(攻方最短/玉方最長) を CSA表記で out に書く。
- * [FIX] 旧実装は mate_length が返った後も can_mate が失効済み lm_jmp へ longjmp し得る
- * 未定義動作 (lm_nodes が累積で 2 億超 → クラッシュ/沈黙) を抱えていた。print_pv 自身が
- * setjmp を張り、budget_s の壁時計予算内で途中まで構築した部分PVを返す。 */
+
 static void print_pv(Pos*p,int D,char*out,double budget_s,int honor_stop=0){
   CYF_ZYF_TEST_STAGE(3);
   out[0]=0; if(honor_stop && g_stop) return; int cur=D,guard=0; char mb[16];
-  lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=honor_stop; // native callers honor stop; CLI default remains separate
+  lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=honor_stop; 
   lm_deadline = budget_s>0 ? now()+budget_s : 0;
   int savedp=g_pathlen, savedu=usp; const Pos original=*p;
-  if(setjmp(lm_jmp)){ g_pathlen=savedp; usp=savedu; *p=original; return; }   /* 予算切れ: 部分PVのまま返す */
+  if(setjmp(lm_jmp)){ g_pathlen=savedp; usp=savedu; *p=original; return; }   
   while(cur>0 && guard++<2000){
     if((honor_stop && g_stop) || (lm_deadline>0 && now()>=lm_deadline)) break;
     int best=-1,bd;
@@ -1588,15 +1316,8 @@ static int parse_csa(Pos*p,const char*text){
     for(int c=0;c<2;c++)for(int t=1;t<=7;t++)used[t]+=p->hand[c][t];
     for(int t=1;t<=7;t++){int rest=full[t]-used[t]; if(rest>0)p->hand[al][t]+=rest;} }
   refresh_kings(p); p->key=compute_key(p); p->bkey=compute_bkey(p); ykey_refresh(p); return 1; }
-/* 直前の solve() が証明した詰みの初手を置換表から即答で引く (手数測定より遥かに軽い)。
- * 手数測定が予算切れでも初手だけは返せるようにする最終フォールバック。 */
-/* ---- [ROOT-HISTORY 2026-10-17] 対局履歴を踏まえた連続王手の千日手の除外 ----
- * 探索木は履歴を持たない (g_pathlen=0 から) ので、証明そのものは履歴非依存。ところが実戦で指す初手は
- * 対局履歴と合わせて「同一局面 4 回 + その間の攻め方の手が全て王手」(連続王手の千日手 = 王手側の反則負け)
- * を成立させ得る。Pyfamate はこれを呼び出し側 (_mate_move_accepted) で検問していたが、Cyfamate は検問なしに
- * Zyfamate の初手を採るため、検問をここ (初手選択) へ移す。
- * 履歴: g_rh_key[0..n] = 開局〜根の局面鍵 (compute_key)、g_rh_chk[k] = k+1 手目が王手だったか。
- * USI では position ... moves から記録する。組込み先は zyf_set_root_history() で渡す (渡さなければ従来どおり)。 */
+
+
 #define ZYF_RH_MAX 2048
 static uint64_t g_rh_key[ZYF_RH_MAX+1]; static unsigned char g_rh_chk[ZYF_RH_MAX]; static int g_rh_n=-1;
 static void zyf_set_root_history(const uint64_t*keys,const unsigned char*checks,int nmoves){
@@ -1605,7 +1326,7 @@ static void zyf_set_root_history(const uint64_t*keys,const unsigned char*checks,
   for(int i=0;i<nmoves;i++) g_rh_chk[i]=checks?checks[i]:0;
   g_rh_n=nmoves; }
 static void zyf_clear_root_history(void){ g_rh_n=-1; }
-/* 根 p (履歴の最終局面と一致すること) で攻め方が mv を指すと連続王手の千日手になるか。 */
+
 static int root_move_perpetual(Pos*p,int mv){
   if(g_rh_n<0 || g_rh_key[g_rh_n]!=p->key) return 0;
   make_move(p,mv); const uint64_t k=p->key; const int chk=in_check(p,p->side); unmake_move(p);
@@ -1613,7 +1334,7 @@ static int root_move_perpetual(Pos*p,int mv){
   int occ=1, i0=g_rh_n+1;
   for(int i=0;i<=g_rh_n;i++) if(g_rh_key[i]==k){ occ++; if(i<i0) i0=i; }
   if(occ<4) return 0;
-  /* 区間 i0..(新局面) の手 = 手番号 i0..g_rh_n (g_rh_n は mv)。攻め方の手は mv と同じ偶奇。 */
+  
   for(int j=i0;j<g_rh_n;j++) if(((g_rh_n-j)&1)==0 && !g_rh_chk[j]) return 0;
   return 1; }
 
@@ -1622,16 +1343,13 @@ static int first_mate_move(Pos*p,int honor_stop=0){
   int mv[MAXMOVES]; int n=gen_checks(p,mv); int first=-1;
   for(int i=0;i<n;i++){ if(honor_stop && g_stop) return -1; if(root_move_perpetual(p,mv[i])) continue;
     int pn,dn; make_move(p,mv[i]); tt_read(p->key,&pn,&dn);
-    /* A check that leaves no legal reply is mate in 1 (gen_checks already drops pawn-drop mates), so prefer it to
-     * the first proven child in generation order, which may be a long mate. */
+    
     int reply[MAXMOVES]; const int mated=gen_legal(p,reply)==0; unmake_move(p);
     if(mated) return mv[i];
     if(pn==0 && first<0) first=mv[i]; }
-  if(first>=0) return first;   /* pn==0 は証明済み詰みのみ (estimate は 0 を書かない) */
+  if(first>=0) return first;   
   return -1; }
-/* [予算規律] 全体の壁時計上限 ≒ tl を厳守する。旧実装は solve 後の mate_length
- * (node上限2億・時間無制限) と print_pv が tl を大幅超過し、親プロセス側 timeout で
- * kill され「詰みは証明済みなのに一行も出力されない」最悪の失敗モードがあった。 */
+
 static void report_solve(Pos p,long nl,double tl,int wantpv){
   Pos p0=p; long nodes; double t=now(),deadline=t+tl;
   int r=solve(&p,nl,tl,&nodes); double dt=now()-t;
@@ -1642,7 +1360,7 @@ static void report_solve(Pos p,long nl,double tl,int wantpv){
       if(wantpv){ char pv[8192]; Pos q2=p0; g_attacker=q2.side;
         double rem2=deadline-now(); if(rem2<0.05)rem2=0.05;
         print_pv(&q2,L,pv,rem2); printf("%s\n",pv); } }
-    else { printf("mate ? nodes %ld time %.3f\n",nodes,dt);   /* 手数不明でも詰み確定 */
+    else { printf("mate ? nodes %ld time %.3f\n",nodes,dt);   
       if(wantpv){ Pos q3=p0; g_attacker=q3.side; int fm=first_mate_move(&q3);
         if(fm>=0){ char mb[16]; move_csa(&q3,fm,q3.side,mb); printf("%s\n",mb); } } } }
   else if(r==0) printf("nomate nodes %ld time %.3f\n",nodes,dt);
@@ -1660,20 +1378,13 @@ static void report_tsumero(Pos p,long nl,double tl){
       print_pv(&q2,L,pv,rem2); printf("True (threat %d)\n%s\n",L,pv); }
     else printf("True (threat ?)\n"); }
   else if(r==0) printf("False\n"); else printf("Unknown\n"); }
-/* n手すき(詰めろの深さ): 受け方がパスを重ねて攻方が詰みを強制できるまでの最小手数。
-   1=詰めろ, 2=パス→攻方が一手で詰めろを作れる, ... cap(maxn)と時間予算で打ち切り。*/
-/* g_tes_deadline: ZCtx */
-/* [FIX-TSUMERO-COPY] 生の *p を solve() に渡してはならない。solve() の中断ハンドラ
- * (setjmp 先) は usp しか巻き戻さず、mid() が make_move で破壊した *p を復元しない。
- * report_tesuki は tes_each()=overall/4 を各 probe に与えるため予算切れ(r==2)は
- * 例外でなく設計上の通常ケースで、その時 *p は df-pn 木の任意の内部節点のまま残る。
- * 呼び元 tesuki() はその壊れた盤で gen_legal/make_move を続け、usp は釣り合うので
- * 何もトラップしない = tesuki の答えが静かにゴミになる。捨てコピーで探索する。
- * (report_solve は Pos 値渡し、report_tsumero は Pos work=n のコピーで元々安全。) */
+
+
+
 static int is_tsumero_p(Pos*p,long nl,double tl){ int d=p->side;
   if(p->ksq[d]>=0 && is_attacked(p,p->ksq[d],d^1)) return 0;
   Pos w=*p; w.side^=1; w.key^=Z_SIDE; w.bkey^=Z_SIDE; w.ybk^=Y_SIDE;
-  { double left=g_tes_deadline-now(); if(tl>left) tl=left<0.001?0.001:left; }   /* [TM-FAST 2026-10-08] tes_each() floors a solve at 50 ms, above the whole budget; the deadline was only checked between solves */
+  { double left=g_tes_deadline-now(); if(tl>left) tl=left<0.001?0.001:left; }   
   long nd; int r=solve(&w,nl,tl,&nd); return r==1; }
 static int defmated(Pos*p){ int d=p->side; return p->ksq[d]>=0 && is_attacked(p,p->ksq[d],d^1) && !has_legal(p,d); }
 static int tesuki(Pos*p,int maxn,long nl,double tl){
@@ -1683,7 +1394,7 @@ static int tesuki(Pos*p,int maxn,long nl,double tl){
   if(maxn<=1) return -1;
   p->side^=1;p->key^=Z_SIDE;p->bkey^=Z_SIDE;p->ybk^=Y_SIDE;
   int mv[MAXMOVES]; int nm=gen_legal(p,mv); int best=-1,unk=0;
-  for(int i=0;i<nm;i++){ if(now()>g_tes_deadline){unk=1;break;}   /* 全体予算をループ内でも確認 */
+  for(int i=0;i<nm;i++){ if(now()>g_tes_deadline){unk=1;break;}   
     make_move(p,mv[i]); int t=tesuki(p,maxn-1,nl,tl); unmake_move(p);
     if(t==-2){unk=1;continue;} if(t>=1){int v=1+t; if(best<0||v<best)best=v; if(best==2)break;} }
   p->side^=1;p->key^=Z_SIDE;p->bkey^=Z_SIDE;p->ybk^=Y_SIDE;
@@ -1697,27 +1408,17 @@ static void report_tesuki(Pos p,int maxn,long nl,double tl,double overall){
   else if(r>=1) printf("tesuki %d\n",r);
   else if(r==-1) printf("tesuki >%d (no threat within cap)\n",maxn);
   else printf("tesuki unknown (budget)\n"); }
-/* tesuki の全体予算 overall から 1 solve あたりの時間を導出 */
+
 static double tes_each(double overall){ double e=overall/4.0; if(e<0.05)e=0.05; return e; }
 
-/* ===== serve: 常駐モード =====
- * one-shot 起動は「プロセス生成 + 数百MB〜GB級ハッシュ表の確保/ページウォーム」を
- * 1 リクエスト毎に支払う。serve は 1 プロセスで stdin から行単位のリクエストを受け、
- * 表を確保済み・ページ温存のまま連続処理する (呼び出しレイテンシが桁で縮む)。
- * プロトコル (1行=1リクエスト, 応答は従来 CLI と同一書式 + 終端行 "=done"):
- *   solve   <nodes> <time> <sfen...>
- *   tsumero <nodes> <time> <sfen...>
- *   tesuki  <maxn> <nodes> <time> <sfen...>   (time は全体予算)
- *   ping    → pong
- *   quit / EOF → 終了
- * 検索状態は従来通りリクエスト毎に世代更新 (solve() 内 g_gen++) で論理クリアされる。 */
+
 static void serve_loop(void){
   char line[16384];
   while(fgets(line,sizeof line,stdin)){
     size_t L=strlen(line); while(L&&(line[L-1]=='\n'||line[L-1]=='\r'))line[--L]=0;
     if(!L)continue;
     if(!strcmp(line,"quit"))break;
-    usp=0; g_pathlen=0;      /* print_pv の make_move は unmake しない — リクエスト毎に必ず巻き戻す */
+    usp=0; g_pathlen=0;      
     if(!strcmp(line,"ping")){ printf("pong\n=done\n"); fflush(stdout); continue; }
     long nl; double tl; int off=-1, maxn;
     if(sscanf(line,"solve %ld %lf %n",&nl,&tl,&off)==2&&off>0&&line[off]){
@@ -1731,9 +1432,7 @@ static void serve_loop(void){
   }
 }
 
-/* ===== USI protocol (ShogiGUI / ShogiHome 登録用) =====
- * 詰将棋専用エンジン。go infinite / go mate infinite で詰み探索を開始し、
- * stop で bestmove を返す。通常の go (depth/movetime 等) も go infinite 扱い。 */
+
 static Pos g_usi_pos;
 static int g_usi_has_pos=0;
 static volatile int g_usi_searching=0;
@@ -1744,7 +1443,7 @@ static pthread_t g_usi_thread;
 typedef struct { long nodes; int result; int mate_len; int bestmove; } UsiResult;
 static UsiResult g_usi_result;
 
-/* print_pv のUSI版: proof tree を辿って USI 形式の手順を stdout に出力 */
+
 static void print_pv_usi(Pos*p,int D,char*out,double budget_s){
   out[0]=0; int cur=D,guard=0; char mb[8];
   lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=0;
@@ -1768,8 +1467,7 @@ static void usi_emit_checkmate(void){
     int L=g_usi_result.mate_len;
     if(L>0){ char pv[8192]; Pos q=g_usi_pos; g_attacker=q.side;
       print_pv_usi(&q,L,pv,5.0);
-      /* [ROOT-HISTORY] PV 生成は履歴を見ないので、初手が連続王手の千日手で除外された手と違うなら
-       * PV ではなく採用初手だけを返す (呼び出し側が指すのは初手)。 */
+      
       char fmb[8]; move_usi(g_usi_result.bestmove,fmb); size_t fl=strlen(fmb);
       if(pv[0] && (strncmp(pv,fmb,fl)!=0 || (pv[fl]!=' ' && pv[fl]!=0))) strcpy(pv,fmb);
       if(pv[0]) printf("checkmate %s\n",pv);
@@ -1851,7 +1549,7 @@ static void usi_loop(void){
         if(!parse_sfen(&g_usi_pos,sfen_buf)){ g_usi_has_pos=0; continue; }
         while(*s==' ')s++;
       }
-      /* [ROOT-HISTORY] 開局からの局面鍵と各手の王手を記録 (連続王手の千日手を初手から除くため)。 */
+      
       static uint64_t rh_k[ZYF_RH_MAX+1]; static unsigned char rh_c[ZYF_RH_MAX]; int rh_n=0, rh_ok=1;
       g_usi_pos.key=compute_key(&g_usi_pos); rh_k[0]=g_usi_pos.key;
       if(!strncmp(s,"moves",5)){
@@ -1877,9 +1575,7 @@ static void usi_loop(void){
     if(!strncmp(line,"go",2)){
       if(!g_usi_has_pos){ printf("bestmove resign\n"); fflush(stdout); continue; }
       g_usi_gomate=!!strstr(line,"mate");
-      /* `go mate <ms>`: answer within <ms> (USI). `go mate infinite` / no number: until stop.
-       * Earlier the limit was ignored (tl=1e9), so a caller that trusted the protocol and waited
-       * for the answer instead of sending stop blocked until the proof finished. */
+      
       g_usi_tlimit=1e9;
       if(g_usi_gomate){ const char*mp=strstr(line,"mate")+4; while(*mp==' ')mp++;
         if(*mp>='0'&&*mp<='9'){ double ms=atof(mp); if(ms>0) g_usi_tlimit=ms/1000.0; } }
@@ -1911,10 +1607,10 @@ static void usi_loop(void){
 }
 #undef malloc
 #undef calloc
-} // namespace Zyfamate
+} 
 
-// Zyfamate が定義したマクロを全て解除 (自動生成: 38 個)。
-// BLACK/WHITE/MV 等は cyfamate の Color/Move を破壊するため取りこぼし厳禁。
+
+
 #undef ADD
 #undef BLACK
 #undef DROP_FROM
