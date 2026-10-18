@@ -507,7 +507,6 @@ static void zchk(const void*q,const char*what,uint64_t bytes){
 static void* zyf_big_alloc(size_t n){ if(n < (2u<<20)) return (std::malloc)(n); void* p = YaneuraOu::aligned_large_pages_alloc(n); if(p) std::memset(p,0,n); return p; }
 #define ZMALLOC(lhs,n,what)     do{ (lhs)=(decltype(lhs))zyf_big_alloc(n);        zchk((lhs),(what),(uint64_t)(n)); }while(0)
 #define ZCALLOC(lhs,c,s,what)   do{ size_t _zn=(size_t)(c)*(size_t)(s); (lhs)=(decltype(lhs))(_zn < (2u<<20) ? (void*)(std::calloc)((c),(s)) : zyf_big_alloc(_zn)); zchk((lhs),(what),(uint64_t)_zn); }while(0)
-
 #else
 #define ZMALLOC(lhs,n,what)     do{ (lhs)=malloc(n);        zchk((lhs),(what),(uint64_t)(n)); }while(0)
 #define ZCALLOC(lhs,c,s,what)   do{ (lhs)=calloc((c),(s));  zchk((lhs),(what),(uint64_t)(c)*(uint64_t)(s)); }while(0)
