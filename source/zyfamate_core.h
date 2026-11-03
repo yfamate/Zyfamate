@@ -419,6 +419,7 @@ struct ZCtx {
 static ZCtx g_ctx[2];
 static thread_local ZCtx* zc=&g_ctx[0];
 static inline void use_context(int i){ zc=&g_ctx[i==1?1:0]; }
+
 #define g_gen zc->g_gen_
 #define tt_key zc->tt_key_
 #define tt_rec zc->tt_rec_
@@ -504,7 +505,11 @@ static void zchk(const void*q,const char*what,uint64_t bytes){
 
 #if defined(ZYFAMATE_HOST_YANEURAOU)
 
-static void* zyf_big_alloc(size_t n){ if(n < (2u<<20)) return (std::malloc)(n); void* p = YaneuraOu::aligned_large_pages_alloc(n); if(p) std::memset(p,0,n); return p; }
+static void* zyf_big_alloc(size_t n){ if(n < (2u<<20)) return (std::malloc)(n); void* p = YaneuraOu::aligned_large_pages_alloc(n);
+#if !defined(_WIN32)   
+  if(p) std::memset(p,0,n);
+#endif
+  return p; }
 #define ZMALLOC(lhs,n,what)     do{ (lhs)=(decltype(lhs))zyf_big_alloc(n);        zchk((lhs),(what),(uint64_t)(n)); }while(0)
 #define ZCALLOC(lhs,c,s,what)   do{ size_t _zn=(size_t)(c)*(size_t)(s); (lhs)=(decltype(lhs))(_zn < (2u<<20) ? (void*)(std::calloc)((c),(s)) : zyf_big_alloc(_zn)); zchk((lhs),(what),(uint64_t)_zn); }while(0)
 #else
@@ -840,6 +845,7 @@ static int is_mated(Pos*p){
   return 1;
 }
 static int use_plus=1;
+static int g_eps=16;  
 
 static int g_order=0;
 static int g_sort=0;    
@@ -966,9 +972,10 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
   uint64_t ck[MAXMOVES]; uint8_t repf[MAXMOVES];
   
   for(int i=0;i<nm;i++){ ck[i]=child_key(p,moves[i]); tt_prefetch(ck[i]); }
-  for(int i=0;i<nm;i++){ make_move(p,moves[i]); assert(ck[i]==p->key); ck[i]=p->key;
-    if(use_plus && tt_find(p->key)<0 && twin_find(p->key)<0){int ep,ed;estimate_mv(p,moves[i],&ep,&ed);tt_store(p->key,ep,ed);}
-    repf[i]=0; unmake_move(p); }
+  
+  for(int i=0;i<nm;i++){ repf[i]=0;
+    if(use_plus && tt_find(ck[i])<0 && twin_find(ck[i])<0){ make_move(p,moves[i]); assert(ck[i]==p->key);
+      int ep,ed;estimate_mv(p,moves[i],&ep,&ed);tt_store(p->key,ep,ed); unmake_move(p); } }
 
   uint8_t dly[MAXMOVES]; int gnx[MAXMOVES];                 
   for(int i=0;i<nm;i++){ dly[i]=0; gnx[i]=-1; }
@@ -1016,8 +1023,10 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
       for(int i=0;i<no;i++)rtout[i]=out[i]; return no; }
     int ctp,ctd,cpn,cdn;
     if(repf[best]){cpn=INF;cdn=0;}else tt_read_ghi(ck[best],&cpn,&cdn);
-    if(is_or){ ctp=(thpn<best2+1?thpn:best2+1); int64_t v=(int64_t)thdn-(dn-cdn); ctd=v>INF?INF:(int)v; }
-    else { ctd=(thdn<best2+1?thdn:best2+1); int64_t v=(int64_t)thpn-(pn-cpn); ctp=v>INF?INF:(int)v; }
+    
+    { const int64_t e2=(int64_t)best2+1+(((int64_t)best2*g_eps)>>8); const int b2=e2>INF?INF:(int)e2;
+    if(is_or){ ctp=(thpn<b2?thpn:b2); int64_t v=(int64_t)thdn-(dn-cdn); ctd=v>INF?INF:(int)v; }
+    else { ctd=(thdn<b2?thdn:b2); int64_t v=(int64_t)thpn-(pn-cpn); ctp=v>INF?INF:(int)v; } }
     make_move(p,moves[best]);
     if(on_path(p->key)){ repf[best]=1; uint64_t a=p->key; int dup=0;
       for(int j=0;j<rtn;j++)if(rep_targets[j]==a){dup=1;break;} if(!dup&&rtn<64)rep_targets[rtn++]=a;
