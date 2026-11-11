@@ -1,0 +1,1613 @@
+
+#ifndef HISSHI_SEARCH_HPP_
+#define HISSHI_SEARCH_HPP_
+
+#include "hisshi_dfpn.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <x86intrin.h>
+
+#include "../../bitboard.h"
+#include "../../mate/mate.h"
+#include "../../misc.h"
+#include "../../usi.h"
+
+namespace hisshi {
+namespace detail {
+
+constexpr std::uint8_t kModeHisshi = 0;
+constexpr std::uint8_t kModeMate = 1;
+
+inline PnDn Add(PnDn a, PnDn b) {
+  if (a >= kInf || b >= kInf) return kInf;
+  const PnDn s = a + b;  
+  return s >= kInf - 1 ? kInf - 1 : s;
+}
+
+inline PnDn NextThreshold(PnDn second) { return second >= kInf - 1 ? kInf : second + 1; }
+
+inline Bitboard g_zone12[SQ_NB_PLUS1][COLOR_NB];
+inline Bitboard g_zone3[SQ_NB_PLUS1][COLOR_NB];
+inline bool g_tables_ready = false;
+
+inline void InitTables() {
+  if (g_tables_ready) return;
+  for (Square k = SQ_ZERO; k < SQ_NB; ++k) {
+    for (Color def : COLOR) {
+      const int fwd = def == WHITE ? 1 : -1;
+      const int kf = file_of(k), kr = rank_of(k);
+      Bitboard z12 = ZERO_BB, z3 = ZERO_BB;
+      auto add = [&](Bitboard& bb, int f, int r) {
+        if (f < 0 || f > 8 || r < 0 || r > 8) return;
+        bb |= Bitboard(Square(f * 9 + r));
+      };
+      for (int df = -1; df <= 1; ++df) add(z12, kf + df, kr - fwd);
+      for (int df = -2; df <= 2; ++df)
+        if (df != 0) add(z12, kf + df, kr);
+      for (int df = -2; df <= 2; ++df) add(z12, kf + df, kr + fwd);
+      for (int df = -1; df <= 1; ++df) add(z3, kf + df, kr + 2 * fwd);
+      g_zone12[k][def] = z12;
+      g_zone3[k][def] = z3;
+    }
+  }
+  for (Color def : COLOR) {
+    g_zone12[SQ_NB][def] = ZERO_BB;
+    g_zone3[SQ_NB][def] = ZERO_BB;
+  }
+  g_tables_ready = true;
+}
+
+inline bool IsSlider(PieceType t) {
+  return t == LANCE || t == BISHOP || t == ROOK || t == HORSE || t == DRAGON;
+}
+
+inline int Sign(int x) { return (x > 0) - (x < 0); }
+
+inline Key BoardKey(const Position& p) { return p.state()->board_key(); }
+
+constexpr PieceType kHandTypes[7] = {PAWN, LANCE, KNIGHT, SILVER, BISHOP, ROOK, GOLD};
+
+inline Hand HandUnion(Hand a, Hand b) {
+  Hand r = static_cast<Hand>(0);
+  for (PieceType p : kHandTypes) add_hand(r, p, std::max(hand_count(a, p), hand_count(b, p)));
+  return r;
+}
+
+inline Hand AndProofHand(Hand uni, Hand atk_hand, Hand def_hand) {
+  Hand r = static_cast<Hand>(0);
+  for (PieceType p : kHandTypes)
+    add_hand(r, p, hand_exists(def_hand, p) ? hand_count(uni, p) : hand_count(atk_hand, p));
+  return r;
+}
+
+inline Hand OrProofHand(Hand child_ph, Move m, const Position& pos) {
+  Hand r = child_ph;
+  if (is_drop(m)) {
+    add_hand(r, move_dropped_piece(m));
+  } else {
+    const Piece cap = pos.piece_on(to_sq(m));
+    if (cap != NO_PIECE) {
+      const PieceType pt = raw_type_of(cap);
+      if (hand_exists(r, pt)) sub_hand(r, pt);
+    }
+  }
+  return r;
+}
+
+struct Child {
+  Move move;
+  Hand ph;  
+  PnDn pn;
+  PnDn dn;
+  std::uint16_t group;
+  std::uint16_t len;
+  std::uint8_t cost;
+  std::uint8_t pass;
+  std::uint8_t rep;
+  std::uint8_t check;
+  std::uint8_t stage;
+  std::uint8_t sim;  
+  std::uint8_t m1;   
+};
+static_assert(sizeof(Child) == 40, "f8: Child size (cache slot count) changed");
+
+struct ChildList {
+  Child* p = nullptr;
+  int n = 0;
+  int cap = 0;
+  Child& operator[](std::size_t i) { return p[i]; }
+  const Child& operator[](std::size_t i) const { return p[i]; }
+  std::size_t size() const { return static_cast<std::size_t>(n); }
+  void clear() { n = 0; }
+  void push_back(const Child& c) {
+    if (n < cap) p[n++] = c;
+  }
+  Child* begin() { return p; }
+  Child* end() { return p + n; }
+  const Child* begin() const { return p; }
+  const Child* end() const { return p + n; }
+};
+
+constexpr int kMaxChildren = 640;  
+
+struct StageInfo {
+  int lazy = 0;  
+  Move last = MOVE_NONE;  
+  int nstages = 0;
+  int begin[4] = {0, 0, 0, 0};  
+  PnDn est_pn[3] = {0, 0, 0};
+  PnDn est_dn[3] = {0, 0, 0};
+};
+
+struct ChildKeyInfo {
+  Key board;
+  Key full;
+  Hand hand;
+  std::uint8_t mode;
+};
+
+struct NodeResult {
+  PnDn pn, dn;
+  std::uint16_t len;
+  bool rep;
+  Hand ph;  
+};
+
+struct Probe {
+  PnDn pn = 1, dn = 1;
+  std::uint16_t len = 0;
+  std::uint16_t best = 0;
+  bool rep = false;
+  bool found = false;
+  Hand ph = static_cast<Hand>(0);  
+};
+
+
+struct SearchImpl {
+  Solver& solver;
+  Position& pos;
+  const Options opt;
+  const Limits lim;
+  bool (*should_stop)();
+
+  Color atk;
+  Color def;
+  Key side_key = 0;
+  std::uint64_t nodes = 0;
+  std::uint64_t next_check = 0;
+  std::uint64_t next_report_ms = 0;
+  std::chrono::steady_clock::time_point start;
+  bool stop = false;
+  std::uint64_t node_cap = 0;
+
+  std::vector<Key> path;
+  std::vector<std::uint16_t> path_count;
+
+  std::vector<std::vector<Child>> child_buf;
+  std::vector<std::vector<PnDn>> gmax_buf;
+  std::vector<Move> killers;
+  std::vector<std::vector<ChildKeyInfo>> key_buf;
+  std::vector<std::vector<Key>> full_buf;
+  std::vector<std::vector<int>> live_buf;
+
+  static constexpr int kCacheMinChildren = 12;
+  static constexpr int kCacheMaxChildren = kMaxChildren;
+  struct CacheTag {
+    Key board;
+    std::uint32_t hand;
+    std::uint8_t mode;
+    std::uint8_t valid;
+    std::uint8_t in_use;  
+    std::uint8_t pad;
+  };
+  std::vector<CacheTag> ctag;
+  struct CacheSlot {
+    std::uint8_t active;
+    std::uint16_t n;
+    std::uint16_t groups;
+    std::uint16_t active_end;
+    StageInfo si;
+    Child ch[kCacheMaxChildren];
+    Key full[kCacheMaxChildren];
+  };
+  CacheSlot* cache = nullptr;
+  std::size_t cache_n = 0;
+  std::vector<CacheSlot> cache_own;
+  std::vector<StateInfo> states;
+
+  int thread_id = 0;
+  std::atomic<bool>* shared_stop = nullptr;
+
+  SearchImpl(Solver& s, Position& p, const Options& o, const Limits& l, bool (*stop_fn)(),
+             int tid = 0, std::atomic<bool>* sstop = nullptr, Color attacker = COLOR_NB, bool main_cache = false)
+      : solver(s), pos(p), opt(o), lim(l), should_stop(stop_fn), thread_id(tid), shared_stop(sstop) {
+    cache_n = static_cast<std::size_t>(std::max(0, opt.cache_slots));
+    ctag.assign(cache_n, CacheTag{});
+    if (main_cache && cache_n) {
+      cache = static_cast<CacheSlot*>(solver.MainCache(cache_n * sizeof(CacheSlot)));
+    } else {
+      cache_own.resize(cache_n);
+      cache = cache_own.data();
+    }
+    atk = attacker == COLOR_NB ? pos.side_to_move() : attacker;
+    def = ~atk;
+    {
+      StateInfo si;
+      const Key before = BoardKey(pos);
+      pos.do_null_move(si);
+      side_key = BoardKey(pos) ^ before;
+      pos.undo_null_move();
+    }
+    path.reserve(opt.max_ply + 8);
+    path_count.assign(1 << 16, 0);
+    child_buf.resize(opt.max_ply + 8);
+    gmax_buf.resize(opt.max_ply + 8);
+    killers.assign(opt.max_ply + 8, MOVE_NONE);
+    key_buf.resize(opt.max_ply + 8);
+    full_buf.resize(opt.max_ply + 8);
+    live_buf.resize(opt.max_ply + 8);
+    states.resize(opt.max_ply + 8);
+    start = lim.origin == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : lim.origin;
+  }
+
+  ~SearchImpl() { FlushNodes(); }
+
+  std::uint64_t ElapsedMs() const {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+  }
+
+  static constexpr std::uint64_t kFinalWeight = 1000;
+  static constexpr std::uint16_t kFullWidthDisproof = 1;  
+  static constexpr PnDn kHintPn = 100;                    
+  static Key NonZero(Key board) { return board ? board : 1; }
+  static std::uint32_t TagHi(Key board) {
+    const auto t = static_cast<std::uint32_t>(static_cast<std::uint64_t>(board) >> 32);
+    return t ? t : 1;
+  }
+  static std::uint16_t TagLo(Key board) { return static_cast<std::uint16_t>(static_cast<std::uint64_t>(board) >> 16); }
+
+  Cluster* GetCluster(Key board) {
+    return &solver.table_[solver.ClusterOf(board)];  
+  }
+
+  struct ClusterLock {
+    Solver::Lock* l = nullptr;
+    ClusterLock(Solver& s, Key board) {
+      if (!s.shared_) return;
+      l = &s.locks_[s.ClusterOf(board) & (Solver::kLocks - 1)];  
+      while (l->v.exchange(1, std::memory_order_acquire))
+        while (l->v.load(std::memory_order_relaxed)) _mm_pause();
+    }
+    ~ClusterLock() {
+      if (l) l->v.store(0, std::memory_order_release);
+    }
+  };
+
+  Probe Lookup(Key board, Hand hand, std::uint8_t mode, Key path_key = 0) {
+    board = NonZero(board);
+    Probe r;
+    bool possible_rep = false;
+    bool hint = false;  
+    Cluster* c = GetCluster(board);
+    ClusterLock lock(solver, board);
+    const std::uint32_t hi = TagHi(board);
+    const std::uint16_t lo = TagLo(board);
+    PnDn pn_lb = 1, dn_lb = 1;
+    int disproof = -1;  
+    unsigned hits = 0;
+#if defined(USE_AVX2)
+    const __m256i keys = _mm256_load_si256(reinterpret_cast<const __m256i*>(c->key));
+    const __m256i eq = _mm256_cmpeq_epi32(keys, _mm256_set1_epi32(static_cast<int>(hi)));
+    hits = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(eq)));
+#else
+    for (int j = 0; j < kClusterSize; ++j)
+      if (c->key[j] == hi) hits |= 1u << j;
+#endif
+    for (; hits; hits &= hits - 1) {
+      const int i = __builtin_ctz(hits);
+      if (c->d[i].tag != lo) continue;
+      const EntryData& e = c->d[i];
+      const Hand eh = static_cast<Hand>(e.hand);
+      if (e.Rep() && e.dn != 0 && e.Mode() == mode) possible_rep = true;
+      const bool we_sup = hand_is_equal_or_superior(hand, eh);  
+      const bool we_inf = hand_is_equal_or_superior(eh, hand);  
+      if (e.pn == 0 && we_sup && (e.Mode() == mode || (mode == kModeHisshi && e.Mode() == kModeMate))) {
+        r.pn = 0; r.dn = kInf; r.len = e.Len(); r.best = e.best; r.found = true; r.rep = false;
+        r.ph = eh;
+        return r;
+      }
+      if (e.dn == 0 && we_inf && (e.Mode() == mode || (mode == kModeMate && e.Mode() == kModeHisshi))) {
+        if (force_full_width && e.Len() != kFullWidthDisproof) {
+          hint = true;  
+          continue;
+        }
+        if (disproof < 0 || (c->d[disproof].Rep() && !e.Rep())) disproof = i;
+        continue;
+      }
+      if (e.Mode() == mode && eh == hand) {
+        r.found = true;
+        r.pn = FromTT(e.pn); r.dn = FromTT(e.dn); r.len = e.Len(); r.best = e.best;
+        continue;
+      }
+      if (we_inf && (e.Mode() == mode || (e.Mode() == kModeHisshi && mode == kModeMate)))
+        pn_lb = std::max(pn_lb, FromTT(e.pn));
+      if (we_sup && (e.Mode() == mode || (e.Mode() == kModeMate && mode == kModeHisshi)))
+        dn_lb = std::max(dn_lb, FromTT(e.dn));
+    }
+    if (disproof >= 0) {
+      const EntryData& e = c->d[disproof];
+      r.pn = kInf; r.dn = 0; r.len = e.Len(); r.best = e.best; r.found = true; r.rep = e.Rep();
+      return r;
+    }
+    if (possible_rep && solver.RepContains(RepKey(path_key))) {
+      r.pn = kInf; r.dn = 0; r.len = 0; r.found = true; r.rep = true;
+      return r;
+    }
+    if (hint && !r.found) {
+      r.pn = kHintPn; r.dn = 1; r.found = true;
+      return r;
+    }
+    if (r.found) {
+      r.pn = std::max(r.pn, pn_lb);
+      r.dn = std::max(r.dn, dn_lb);
+    } else {
+      r.pn = pn_lb;
+      r.dn = dn_lb;
+    }
+    return r;
+  }
+
+  void Store(Key board, Hand hand, std::uint8_t mode, PnDn pn, PnDn dn, std::uint16_t len,
+             Move best, bool rep, std::uint64_t amount) {
+    board = NonZero(board);
+    Cluster* c = GetCluster(board);
+    ClusterLock lock(solver, board);
+    solver.MarkDirty(static_cast<std::size_t>(c - solver.table_.data()));  
+    const std::uint32_t hi = TagHi(board);
+    const std::uint16_t lo = TagLo(board);
+    auto same_board = [&](int i) { return c->key[i] == hi && c->d[i].tag == lo; };
+    int target = -1;
+    for (int i = 0; i < kClusterSize; ++i) {
+      if (same_board(i) && c->d[i].Mode() == mode && c->d[i].hand == hand) {
+        target = i;
+        break;
+      }
+    }
+    if (dn == 0 && rep && !hisshi_ply_limit) {
+      if (target >= 0) {
+        EntryData& t = c->d[target];
+        if (t.pn != 0 && t.dn != 0) t.lmr = static_cast<std::uint16_t>(t.lmr | 0x8000);
+        return;
+      }
+      pn = 1;
+      dn = 1;
+    } else if (target >= 0 && pn != 0 && dn != 0 && c->d[target].Rep() && c->d[target].dn != 0) {
+      rep = true;  
+    }
+    if (target >= 0) {
+      const EntryData& t = c->d[target];
+      if (t.pn == 0 && pn != 0) return;
+      if (t.dn == 0 && !t.Rep() && pn != 0 && dn != 0) return;
+    }
+    if (dn == 0) {
+      for (int i = 0; i < kClusterSize; ++i) {
+        if (!same_board(i) || c->d[i].pn != 0) continue;
+        const EntryData& e = c->d[i];
+        if (hand_is_equal_or_superior(hand, static_cast<Hand>(e.hand)) &&
+            (e.Mode() == mode || (mode == kModeHisshi && e.Mode() == kModeMate)))
+          return;
+      }
+    }
+    if (pn == 0 || dn == 0) {
+      for (int i = 0; i < kClusterSize; ++i) {
+        if (i == target || !same_board(i) || c->d[i].Mode() != mode) continue;
+        const Hand eh = static_cast<Hand>(c->d[i].hand);
+        if (pn == 0 && hand_is_equal_or_superior(eh, hand)) c->key[i] = 0;
+        else if (dn == 0 && c->d[i].pn != 0 && hand_is_equal_or_superior(hand, eh)) c->key[i] = 0;
+      }
+    }
+    const std::uint16_t amt = EncodeAmount(amount);
+    if (target < 0) {
+      for (int i = 0; i < kClusterSize; ++i)
+        if (c->key[i] == 0) { target = i; break; }
+    }
+    if (target < 0) {
+      std::uint64_t worst = ~0ULL;
+      for (int i = 0; i < kClusterSize; ++i) {
+        const EntryData& e = c->d[i];
+        std::uint64_t v = DecodeAmount(e.amount);
+        if (e.pn == 0 || e.dn == 0) v = v * kFinalWeight;
+        if (e.pn == 0 && solver.proofs_only_) v += 1ULL << 40;
+        if (v < worst) { worst = v; target = i; }
+      }
+      c->d[target].amount = 0;
+    }
+    EntryData& e = c->d[target];
+    if (same_board(target) && e.Mode() == mode && e.hand == hand)
+      e.amount = std::max(e.amount, amt);
+    else
+      e.amount = amt;
+    c->key[target] = hi;
+    e.tag = lo;
+    e.hand = static_cast<std::uint32_t>(hand);
+    if (dn == 0) len = FullWidth() ? kFullWidthDisproof : 0;  
+    if ((pn < kInf && pn >= kTTInf - 1) || (dn < kInf && dn >= kTTInf - 1)) ++stat_clamp32;
+    if (pn == kInf - 1 || dn == kInf - 1) ++stat_sat;
+    e.pn = ToTT(pn);
+    e.dn = ToTT(dn);
+    e.lmr = static_cast<std::uint16_t>(std::min<int>(len, 0x3fff) | ((mode & 1) << 14) | ((rep ? 1 : 0) << 15));
+    e.best = Move16(best).to_u16();
+  }
+
+  void EraseProofs(Key board, Hand hand, std::uint8_t mode) {
+    board = NonZero(board);
+    Cluster* c = GetCluster(board);
+    ClusterLock lock(solver, board);
+    const std::uint32_t hi = TagHi(board);
+    const std::uint16_t lo = TagLo(board);
+    for (int i = 0; i < kClusterSize; ++i) {
+      if (c->key[i] != hi || c->d[i].tag != lo || c->d[i].pn != 0) continue;
+      const EntryData& e = c->d[i];
+      if ((e.Mode() == mode || e.Mode() == kModeMate) && hand_is_equal_or_superior(hand, static_cast<Hand>(e.hand)))
+        c->key[i] = 0;
+    }
+  }
+
+  bool InPath(Key k) const {
+    if (!path_count[k & 0xffff]) return false;
+    for (Key p : path)
+      if (p == k) return true;
+    return false;
+  }
+  void PushPath(Key k) {
+    path.push_back(k);
+    path_keys.push_back(PathMix(path_keys.empty() ? 0 : path_keys.back(), k));
+    ++path_count[k & 0xffff];
+  }
+  void PopPath() {
+    --path_count[path.back() & 0xffff];
+    path.pop_back();
+    path_keys.pop_back();
+  }
+
+  std::vector<Key> path_keys;
+  static Key PathMix(Key h, Key k) {
+    std::uint64_t x = static_cast<std::uint64_t>(h) ^ (static_cast<std::uint64_t>(k) + 0x9E3779B97F4A7C15ULL);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return static_cast<Key>(x ? x : 1);
+  }
+  Key CurrentPathKey() const { return path_keys.empty() ? 0 : path_keys.back(); }
+  static constexpr Key kMateSalt = 0x5D588B656C078965ULL;
+  static Key PathEntry(Key k, std::uint8_t mode) { return mode == kModeMate ? k ^ kMateSalt : k; }
+  bool force_full_width = false;
+  bool FullWidth() const { return opt.full_width || force_full_width; }
+  static constexpr Key kFullWidthRepSalt = 0x2545F4914F6CDD1DULL;
+  Key RepKey(Key path_key) const { return path_key && FullWidth() ? path_key ^ kFullWidthRepSalt : path_key; }
+  bool rederive_root = false;
+  int rederive_ply = -1;
+  bool skip_m1 = false;  
+  Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
+  bool RepAt(Key path_key) const {
+    return solver.RepContains(path_key) || solver.RepContains(path_key ^ kFullWidthRepSalt);
+  }
+
+  static bool UselessNonPromotion(const Position& p, Move m) {
+    if (is_drop(m) || is_promote(m)) return false;
+    const Piece pc = p.moved_piece_before(m);
+    const PieceType t = type_of(pc);
+    if (t != PAWN && t != BISHOP && t != ROOK) return false;
+    const Color us = color_of(pc);
+    const Square from = from_sq(m), to = to_sq(m);
+    auto in_enemy = [&](Square s) {
+      const int r = rank_of(s);
+      return us == BLACK ? r <= RANK_3 : r >= RANK_7;
+    };
+    return in_enemy(from) || in_enemy(to);
+  }
+
+  bool IsCandidate(Move m) const {
+    const Square ksq = pos.king_square(def);
+    const Square to = to_sq(m);
+    const Piece after = pos.moved_piece_after(m);
+    const PieceType t = type_of(after);
+    Bitboard occ = pos.pieces();
+    if (!is_drop(m)) occ ^= Bitboard(from_sq(m));
+    occ |= Bitboard(to);
+    const Bitboard eff = effects_from(after, to, occ);
+    if (eff & g_zone12[ksq][def]) return true;
+    if (t == KNIGHT && (eff & g_zone3[ksq][def])) return true;
+    if (!is_drop(m)) {
+      const Piece cap = pos.piece_on(to);
+      if (cap != NO_PIECE && type_of(cap) != PAWN) return true;
+    }
+    const PieceType raw = is_drop(m) ? move_dropped_piece(m) : type_of(pos.moved_piece_before(m));
+    if ((raw == PAWN || raw == LANCE) && pos.attackers_to(def, to).pop_count() >= 2) return true;
+    const int f = file_of(to), r = rank_of(to), kf = file_of(ksq), kr = rank_of(ksq);
+    if (t == ROOK || t == DRAGON) {
+      if (std::abs(f - kf) <= 1 || std::abs(r - kr) <= 1) return true;
+    } else if (t == BISHOP || t == HORSE) {
+      if (std::abs((f + r) - (kf + kr)) <= 1 || std::abs((f - r) - (kf - kr)) <= 1) return true;
+    } else if (t == LANCE) {
+      const bool toward = atk == BLACK ? r > kr : r < kr;
+      if (std::abs(f - kf) <= 1 && toward) return true;
+    }
+    return false;
+  }
+
+  int OrGroupKey(Move m, int index) const {
+    const Square to = to_sq(m);
+    if (!is_drop(m) && pos.piece_on(to) != NO_PIECE) return 16 + to;  
+    const Square ksq = pos.king_square(def);
+    const Piece after = pos.moved_piece_after(m);
+    if (ksq != SQ_NB && IsSlider(type_of(after)) && (effects_from(after, to, ZERO_BB) & Bitboard(ksq))) {
+      const int df = Sign(file_of(ksq) - file_of(to)), dr = Sign(rank_of(ksq) - rank_of(to));
+      return (df + 1) * 3 + (dr + 1);  
+    }
+    return 1000 + index;
+  }
+
+  enum : int { kGEscape = 110, kGCounter = 111, kGBlock = 112, kGOther = 113 };
+
+  int AndGroupKey(Move m, int index, Move last) const {
+    const Square ksq = pos.king_square(def);
+    const Square to = to_sq(m);
+    if (pos.in_check()) {
+      if (!is_drop(m) && from_sq(m) == ksq) return 1000 + index;
+      if (!is_drop(m) && pos.piece_on(to) != NO_PIECE) return 1000 + index;
+      return 120 + static_cast<int>(to);
+    }
+    if (!is_drop(m) && from_sq(m) == ksq) return 1000 + index;
+    const Bitboard around = kingEffect(ksq);
+    if (!is_drop(m)) {
+      const Piece cap = pos.piece_on(to);
+      if (cap != NO_PIECE) {
+        const PieceType ct = raw_type_of(cap);
+        const bool major = !(ct == PAWN || ct == LANCE || ct == KNIGHT);
+        if (major || (around & Bitboard(to)) || (is_ok(last) && to == to_sq(last))) return 16 + to;
+        return kGOther;
+      }
+      if (around & Bitboard(from_sq(m))) return kGEscape;
+      const PieceType mt = type_of(pos.moved_piece_before(m));
+      if (mt == BISHOP || mt == ROOK || mt == HORSE || mt == DRAGON) return kGOther;
+    }
+    const Piece after = pos.moved_piece_after(m);
+    Bitboard occ = pos.pieces();
+    if (!is_drop(m)) occ ^= Bitboard(from_sq(m));
+    occ |= Bitboard(to);
+    if (effects_from(after, to, occ) & (around | g_zone3[ksq][def])) return kGCounter;
+    if (is_ok(last)) {
+      const Square lto = to_sq(last);
+      const Piece lp = pos.piece_on(lto);
+      if (lp != NO_PIECE && color_of(lp) == atk && IsSlider(type_of(lp)) &&
+          (effects_from(lp, lto, pos.pieces()) & Bitboard(to)))
+        return kGBlock;
+    }
+    return kGOther;
+  }
+
+  static void SortByStage(Child* first, Child* last) {
+    const int n = static_cast<int>(last - first);
+    if (n < 2) return;
+    int counts[3] = {0, 0, 0};
+    bool sorted = true;
+    for (int i = 0; i < n; ++i) {
+      ++counts[first[i].stage];
+      if (i && first[i - 1].stage > first[i].stage) sorted = false;
+    }
+    if (sorted) return;
+    static thread_local Child scratch[kMaxChildren];
+    int next[3] = {0, counts[0], counts[0] + counts[1]};
+    for (int i = 0; i < n; ++i) scratch[next[first[i].stage]++] = first[i];
+    std::copy(scratch, scratch + n, first);
+  }
+
+  void ExpandLazy(ChildList& ch, int& groups) {
+    static thread_local int key_to_group[256];
+    std::fill(std::begin(key_to_group), std::end(key_to_group), -1);
+    const std::size_t n0 = ch.size();
+    Move present[4];
+    int npresent = 0;
+    for (std::size_t i = 0; i < n0 && npresent < 4; ++i)
+      if (!ch[i].check) present[npresent++] = ch[i].move;
+    for (const auto& em : MoveList<NON_EVASIONS_ALL>(pos)) {
+      const Move m = em.move;
+      if (!FullWidth() && (UselessNonPromotion(pos, m) || !IsCandidate(m))) continue;
+      if (pos.gives_check(m) || !pos.legal(m)) continue;
+      bool dup = false;
+      for (int i = 0; i < npresent; ++i)
+        if (present[i] == m) { dup = true; break; }
+      if (dup) continue;
+      Child c{};
+      c.move = m;
+      c.pn = 1;
+      c.dn = 1;
+      c.cost = static_cast<std::uint8_t>(opt.non_check_cost);
+      c.stage = 1;
+      const int key = OrGroupKey(m, static_cast<int>(ch.size()));
+      if (key >= 1000) {
+        c.group = static_cast<std::uint16_t>(groups++);
+      } else {
+        int& g = key_to_group[key];
+        if (g < 0) g = groups++;
+        c.group = static_cast<std::uint16_t>(g);
+      }
+      ch.push_back(c);
+    }
+  }
+
+  PnDn EstimateRelevantDefences() const {
+    const Square ksq = pos.king_square(def);
+    Bitboard to = kingEffect(ksq) & ~pos.pieces(def);
+    PnDn n = 1;
+    while (to) {
+      const Square sq = to.pop();
+      if (!pos.effected_to(atk, sq, ksq)) ++n;
+    }
+    return n;
+  }
+
+  void ExpandLazyAnd(ChildList& ch, int& groups, StageInfo& si) {
+    static thread_local int key_to_group[256];
+    std::fill(std::begin(key_to_group), std::end(key_to_group), -1);
+    const std::size_t n0 = ch.size();
+    for (const auto& em : MoveList<NON_EVASIONS_ALL>(pos)) {
+      const Move m = em.move;
+      if (!pos.legal(m)) continue;
+      const int key = AndGroupKey(m, static_cast<int>(ch.size()), si.last);
+      Child c{};
+      c.move = m;
+      c.pn = 1;
+      c.dn = 1;
+      c.stage = static_cast<std::uint8_t>(key == kGOther ? 2 : 1);
+      if (key >= 1000) {
+        c.group = static_cast<std::uint16_t>(groups++);
+      } else {
+        int& g = key_to_group[key];
+        if (g < 0) g = groups++;
+        c.group = static_cast<std::uint16_t>(g);
+      }
+      ch.push_back(c);
+    }
+    SortByStage(ch.begin() + n0, ch.end());
+    int b2 = static_cast<int>(ch.size());
+    for (std::size_t i = n0; i < ch.size(); ++i)
+      if (ch[i].stage == 2) { b2 = static_cast<int>(i); break; }
+    si.begin[2] = b2;
+    si.begin[3] = static_cast<int>(ch.size());
+    static thread_local std::vector<std::uint8_t> seen;
+    seen.assign(groups, 0);
+    si.est_pn[1] = si.est_pn[2] = 0;
+    for (std::size_t i = n0; i < ch.size(); ++i)
+      if (!seen[ch[i].group]) { seen[ch[i].group] = 1; si.est_pn[ch[i].stage] += 1; }
+    si.lazy = 0;
+  }
+
+
+  int Expand(ChildList& ch, bool or_node, std::uint8_t mode, Move last, int ply,
+             StageInfo& si) {
+    ch.clear();
+    static thread_local int key_to_group[256];
+    std::fill(std::begin(key_to_group), std::end(key_to_group), -1);
+    int groups = 0;
+    auto group_of = [&](int key) -> int {
+      if (key >= 1000) return groups++;
+      int& g = key_to_group[key];
+      if (g < 0) g = groups++;
+      return g;
+    };
+
+    auto push = [&](Move m, bool pass, bool check, int cost, int gkey, int stage) {
+      Child c{};
+      c.move = m;
+      c.pn = 1;
+      c.dn = 1;
+      c.cost = static_cast<std::uint8_t>(cost);
+      c.pass = pass;
+      c.check = check;
+      c.stage = static_cast<std::uint8_t>(stage);
+      c.group = static_cast<std::uint16_t>(group_of(gkey));
+      ch.push_back(c);
+    };
+    const Move killer = killers[ply];
+
+    if (or_node) {
+      if (mode == kModeMate && pos.in_check()) {
+        for (const auto& em : MoveList<EVASIONS_ALL>(pos)) {
+          const Move m = em.move;
+          if (!pos.gives_check(m) || !pos.legal(m)) continue;
+          push(m, false, true, 0, OrGroupKey(m, static_cast<int>(ch.size())), 0);
+        }
+      } else if (mode == kModeMate) {
+        for (const auto& em : MoveList<CHECKS_ALL>(pos)) {
+          const Move m = em.move;
+          if (!pos.legal(m)) continue;
+          push(m, false, true, 0, OrGroupKey(m, static_cast<int>(ch.size())), 0);
+        }
+      } else if (pos.in_check()) {
+        for (const auto& em : MoveList<EVASIONS_ALL>(pos)) {
+          const Move m = em.move;
+          if (!pos.legal(m)) continue;
+          const bool chk = pos.gives_check(m);
+          push(m, false, chk, chk ? 0 : opt.non_check_cost, OrGroupKey(m, static_cast<int>(ch.size())), 0);
+        }
+      } else {
+        for (const auto& em : MoveList<CHECKS_ALL>(pos)) {
+          const Move m = em.move;
+          if (!pos.legal(m)) continue;
+          push(m, false, true, 0, OrGroupKey(m, static_cast<int>(ch.size())), 0);
+        }
+        if (killer != MOVE_NONE && pos.pseudo_legal_s<true>(killer) && pos.legal(killer) &&
+            !pos.gives_check(killer))
+          push(killer, false, false, opt.non_check_cost, OrGroupKey(killer, static_cast<int>(ch.size())), 0);
+        for (std::size_t i = 0; i < ch.size(); ++i)
+          if (ch[i].move == killer) {
+            std::rotate(ch.begin(), ch.begin() + i, ch.begin() + i + 1);
+            break;
+          }
+        si = StageInfo{};
+        si.nstages = 2;
+        si.begin[0] = 0;
+        si.begin[1] = si.begin[2] = static_cast<int>(ch.size());
+        si.est_pn[0] = 1;
+        si.est_pn[1] = static_cast<PnDn>(opt.lazy_pn + opt.non_check_cost);
+        si.est_dn[1] = static_cast<PnDn>(opt.lazy_dn);
+        si.lazy = 1;
+        return groups;
+      }
+      if (killer != MOVE_NONE) {
+        for (std::size_t i = 0; i < ch.size(); ++i)
+          if (ch[i].move == killer) {
+            std::rotate(ch.begin(), ch.begin() + i, ch.begin() + i + 1);
+            break;
+          }
+      }
+    } else {
+      if (pos.in_check()) {
+        std::uint32_t drop_seen = 0;  
+        Square drop_sq[8];
+        int ndrop_sq = 0;
+        for (const auto& em : MoveList<EVASIONS_ALL>(pos)) {
+          const Move m = em.move;
+          if (!pos.legal(m)) continue;
+          const int g = AndGroupKey(m, static_cast<int>(ch.size()), last);
+          int stage = (g >= 120 && g < 120 + SQ_NB) ? 1 : 0;
+          if (stage == 1 && is_drop(m)) {
+            int k = 0;
+            while (k < ndrop_sq && drop_sq[k] != to_sq(m)) ++k;
+            if (k == ndrop_sq && ndrop_sq < 8) drop_sq[ndrop_sq++] = to_sq(m);
+            if (k < 8 && (drop_seen >> k & 1)) stage = 2;
+            else if (k < 8) drop_seen |= 1u << k;
+          }
+          push(m, false, false, 0, g, stage);
+        }
+      } else {
+        push(MOVE_NULL, true, false, 0, 1000 + 0, 0);
+        si = StageInfo{};
+        si.nstages = 3;
+        si.begin[0] = 0;
+        si.begin[1] = si.begin[2] = si.begin[3] = 1;
+        si.est_pn[1] = EstimateRelevantDefences();
+        si.est_pn[2] = 1;
+        si.est_dn[1] = si.est_dn[2] = static_cast<PnDn>(opt.and_stage_dn);
+        si.lazy = 2;
+        si.last = last;
+        return groups;
+      }
+    }
+
+    SortByStage(ch.begin(), ch.end());
+    si = StageInfo{};
+    int last_stage = -1;
+    static thread_local std::vector<std::uint8_t> seen_group;
+    seen_group.assign(groups, 0);
+    for (int i = 0; i < static_cast<int>(ch.size()); ++i) {
+      const int st = ch[i].stage;
+      while (last_stage < st) {
+        ++last_stage;
+        si.begin[last_stage] = i;
+        si.est_pn[last_stage] = or_node ? kInf : 0;
+        si.est_dn[last_stage] = or_node ? 0
+                                : static_cast<PnDn>(pos.in_check() ? opt.check_stage_dn : opt.and_stage_dn);
+      }
+      const Child& c = ch[i];
+      if (or_node) {
+        si.est_pn[st] = std::min<PnDn>(si.est_pn[st], 1 + c.cost);
+        if (!seen_group[c.group]) { seen_group[c.group] = 1; si.est_dn[st] += 1; }
+      } else {
+        if (!seen_group[c.group]) { seen_group[c.group] = 1; si.est_pn[st] += 1; }
+      }
+    }
+    si.nstages = last_stage + 1;
+    si.begin[si.nstages] = static_cast<int>(ch.size());
+    return groups;
+  }
+
+  void ChildKey(const Child& c, std::uint8_t mode, Key& board, Hand& hand, std::uint8_t& cmode,
+                Key& full) {
+    if (c.pass) {
+      board = BoardKey(pos) ^ side_key;
+      hand = pos.hand_of(atk);
+      cmode = kModeMate;
+      full = PathEntry(pos.key() ^ side_key, kModeMate);
+      return;
+    }
+    board = pos.board_key_after(c.move);
+    full = PathEntry(pos.key_after(c.move), mode);
+    hand = pos.hand_of(atk);
+    cmode = mode;
+    if (pos.side_to_move() == atk) {
+      if (is_drop(c.move)) {
+        sub_hand(hand, move_dropped_piece(c.move));
+      } else {
+        const Piece cap = pos.piece_on(to_sq(c.move));
+        if (cap != NO_PIECE) add_hand(hand, raw_type_of(cap));
+      }
+    }
+  }
+
+  void FlushNodes() {
+    solver.total_nodes_.fetch_add(nodes - nodes_reported, std::memory_order_relaxed);
+    nodes_reported = nodes;
+    solver.stat_new_.fetch_add(stat_new, std::memory_order_relaxed);
+    solver.stat_tt_return_.fetch_add(stat_tt_return, std::memory_order_relaxed);
+    solver.stat_clamp32_.fetch_add(stat_clamp32, std::memory_order_relaxed);
+    solver.stat_sat_.fetch_add(stat_sat, std::memory_order_relaxed);
+    stat_new = stat_tt_return = stat_clamp32 = stat_sat = 0;
+  }
+  std::uint64_t stat_new = 0, stat_tt_return = 0, stat_clamp32 = 0, stat_sat = 0;
+
+  bool ignore_limits = false;
+
+  bool LimitReached() const {
+    return (lim.time_ms && static_cast<std::int64_t>(ElapsedMs()) >= lim.time_ms) ||
+           (lim.nodes && solver.total_nodes_.load(std::memory_order_relaxed) >= lim.nodes) ||
+           (should_stop && should_stop());
+  }
+
+  void CheckLimits() {
+    next_check = nodes + 4096;
+    FlushNodes();
+    const auto ms = ElapsedMs();
+    const bool node_limit = lim.nodes && solver.total_nodes_.load(std::memory_order_relaxed) >= lim.nodes;
+    if (ignore_limits) {
+      if (node_cap && nodes >= node_cap) stop = true;
+    } else if ((node_cap && nodes >= node_cap) || node_limit || (lim.time_ms && static_cast<std::int64_t>(ms) >= lim.time_ms) ||
+        (should_stop && should_stop()) || (shared_stop && shared_stop->load(std::memory_order_relaxed)))
+      stop = true;
+    if (report && lim.pv_interval_ms > 0 && ms >= next_report_ms) {
+      next_report_ms = ms + lim.pv_interval_ms;
+      PrintProgress(ms);
+    }
+  }
+
+  std::uint64_t nodes_reported = 0;
+  PnDn live_root_pn = 1, live_root_dn = 1;
+  Move live_root_best = MOVE_NONE;
+  bool live_in_child = false;
+  PnDn live_rest_pn = kInf, live_rest_dn = 0;  
+  PnDn live_group_dn = 0;                      
+  PnDn live_child_cost = 0;
+  PnDn live_child_pn = 1, live_child_dn = 1;
+  bool report = false;       
+  int seldepth = 0;          
+  std::string root_sfen;     
+
+  static std::string ScoreString(PnDn pn, PnDn dn) {
+    if (pn == 0) return "mate +";
+    if (dn == 0) return "mate -";
+    double v = -600.0 * std::log(static_cast<double>(pn) / static_cast<double>(std::max<PnDn>(dn, 1)));
+    v = std::max(-30000.0, std::min(30000.0, v));
+    return "cp " + std::to_string(static_cast<int>(v));
+  }
+
+  std::string BestLine(std::uint8_t mode, int& len) const {
+    len = 0;
+    if (root_sfen.empty()) return "";
+    Position p;
+    std::vector<StateInfo> st(65);
+    p.set(root_sfen, &st[64], pos.this_thread());
+    std::string out;
+    std::vector<Key> seen;
+    for (int i = 0; i < 64; ++i) {
+      if (std::find(seen.begin(), seen.end(), p.key()) != seen.end()) break;
+      seen.push_back(p.key());
+      const Probe pr = const_cast<SearchImpl*>(this)->Lookup(BoardKey(p), p.hand_of(atk), mode);
+      Move m = MOVE_NONE;
+      if (i == 0 && live_root_best != MOVE_NONE && pr.pn != 0) {
+        m = p.to_move(Move16(live_root_best));
+      } else {
+        if (!pr.found && pr.pn != 0 && pr.dn != 0) break;
+        m = p.to_move(Move16(pr.best));
+      }
+      if (m == MOVE_NONE || m == MOVE_NULL || !p.pseudo_legal_s<true>(m) || !p.legal(m)) break;
+      out += (out.empty() ? "" : " ") + to_usi_string(m);
+      p.do_move(m, st[i]);
+      ++len;
+      if (pr.pn == 0 && pr.len <= 1 && p.side_to_move() != atk && MoveList<LEGAL_ALL>(p).size() == 0) break;  
+    }
+    return out;
+  }
+
+  void PrintProgress(std::uint64_t ms) {
+    const std::uint64_t total = solver.total_nodes_.load(std::memory_order_relaxed);
+    const std::uint64_t nps = ms ? total * 1000 / ms : 0;
+    PnDn pn = live_root_pn, dn = live_root_dn;
+    if (live_in_child) {
+      if (live_child_pn == 0) {
+        pn = 0;
+        dn = kInf;
+      } else {
+        pn = std::min(live_rest_pn, live_child_dn == 0 ? kInf : Add(live_child_pn, live_child_cost));
+        dn = Add(live_rest_dn, std::max(live_group_dn, live_child_dn));
+        if (pn > kInf) pn = kInf;
+      }
+    }
+    if (!root_sfen.empty()) {
+      Position p;
+      StateInfo si;
+      p.set(root_sfen, &si, pos.this_thread());
+      const Probe pr = Lookup(BoardKey(p), p.hand_of(atk), kModeHisshi);
+      if (pr.pn == 0 || (pr.dn == 0 && !pr.rep)) { pn = pr.pn; dn = pr.dn; }
+    }
+    int len = 0;
+    const std::string line = BestLine(kModeHisshi, len);
+    std::ostringstream os;
+    os << "info depth " << path.size() << " seldepth " << std::max<int>(seldepth, static_cast<int>(path.size()))
+       << " time " << ms << " nodes " << total << " nps " << nps << " hashfull " << solver.Hashfull()
+       << " score " << ScoreString(pn, dn);
+    if (!line.empty()) os << " pv " << line;
+    sync_cout << os.str() << sync_endl;
+    sync_cout << "info string pn=" << (pn >= kInf ? std::string("inf") : std::to_string(pn))
+              << " dn=" << (dn >= kInf ? std::string("inf") : std::to_string(dn))
+              << " threads=" << std::max(1, opt.threads) << " " << solver.StatsString() << sync_endl;
+    seldepth = 0;
+  }
+
+  std::uint64_t Tie(const ChildList& ch, int i) const {
+    if (i < 0) return ~0ULL;
+    if (thread_id == 0) return static_cast<std::uint64_t>(i);
+    return (static_cast<std::uint64_t>(ch[i].move) * 0x9E3779B97F4A7C15ULL +
+            static_cast<std::uint64_t>(thread_id) * 0x632BE59BD9B4E019ULL) >> 16;
+  }
+
+  static constexpr int kMateEps = 50;
+  PnDn Epsilon(PnDn second, std::uint8_t mode) const {
+    const int eps = mode == kModeMate ? std::max(opt.eps_percent, opt.mate_eps) : opt.eps_percent;  
+    if (eps <= 0 || second >= kInf - 1) return second;
+    const PnDn e = static_cast<PnDn>(eps);
+    return Add(second, second / 100 * e + (second % 100 * e + 99) / 100);
+  }
+
+
+  struct NodeWork {
+    ChildList ch;
+    Key* fulls = nullptr;     
+    StageInfo si;
+    int groups = 0;
+    int active = 0;           
+    int active_end = 0;       
+    int n = 0;                
+    std::vector<PnDn>* gmax;  
+    std::vector<int>* live;   
+    CacheSlot* slot = nullptr;
+    CacheTag* tag = nullptr;  
+    bool cached = false;      
+  };
+
+  bool MateInOne(Hand hand, NodeResult& r, Move* mate_out = nullptr) {
+    const Move mate = Mate::mate_1ply(pos);
+    if (mate == MOVE_NONE) return false;
+    if (mate_out) *mate_out = mate;
+    Hand after = hand;
+    if (is_drop(mate)) {
+      sub_hand(after, move_dropped_piece(mate));
+    } else if (pos.piece_on(to_sq(mate)) != NO_PIECE) {
+      add_hand(after, raw_type_of(pos.piece_on(to_sq(mate))));
+    }
+    const Hand child_ph = AndProofHand(static_cast<Hand>(0), after, pos.hand_of(def));
+    r = NodeResult{0, kInf, 1, false, OrProofHand(child_ph, mate, pos)};
+    return true;
+  }
+
+  void OpenNode(NodeWork& w, Key board, Hand hand, std::uint8_t mode, bool or_node, Move last, int ply) {
+    if (cache_n && !force_full_width) {  
+      const std::uint64_t h = static_cast<std::uint64_t>(board) ^
+                              (static_cast<std::uint64_t>(hand) * 0x9E3779B97F4A7C15ULL) ^ mode;
+      const std::size_t ix = (h >> 7) % cache_n;
+      w.tag = &ctag[ix];
+      w.slot = w.tag->in_use ? nullptr : &cache[ix];  
+      w.cached = w.slot != nullptr && w.tag->valid && w.tag->board == board &&
+                 w.tag->hand == static_cast<std::uint32_t>(hand) && w.tag->mode == mode;
+    }
+    if (w.cached) {
+      HB_CNT(kHbCacheHit);
+      CacheSlot& slot = *w.slot;
+      w.si = slot.si;
+      w.groups = slot.groups;
+      w.active = slot.active;
+      w.active_end = slot.active_end;
+      w.tag->in_use = 1;
+      w.ch.p = slot.ch;
+      w.ch.n = slot.n;
+      w.ch.cap = kCacheMaxChildren;
+      w.fulls = slot.full;
+      for (int i = 0; i < w.active_end; ++i) {
+        Child& c = w.ch[i];
+        if (InPath(w.fulls[i])) {
+          c.pn = kInf; c.dn = 0; c.rep = 1;
+          continue;
+        }
+        if (!c.rep) continue;
+        ChildKeyInfo k;
+        ChildKey(c, mode, k.board, k.hand, k.mode, k.full);
+        const Probe p = Lookup(k.board, k.hand, k.mode, ChildPathKey(k.full));
+        c.pn = p.pn; c.dn = p.dn; c.len = p.len; c.rep = p.rep; c.ph = p.ph;
+      }
+    } else {
+      if (child_buf[ply].empty()) {
+        child_buf[ply].resize(kMaxChildren);
+        full_buf[ply].resize(kMaxChildren);
+      }
+      w.ch.p = child_buf[ply].data();
+      w.ch.n = 0;
+      w.ch.cap = kMaxChildren;
+      w.fulls = full_buf[ply].data();
+      HB_CNT(kHbExpand);
+      w.groups = Expand(w.ch, or_node, mode, last, ply, w.si);
+    }
+    w.n = static_cast<int>(w.ch.size());
+  }
+
+  void Activate(NodeWork& w, std::uint8_t mode, int ply) {
+    if (w.si.lazy && w.active == 1) {
+      if (w.si.lazy == 2) {
+        HB_CNT(kHbLazyAnd);
+        ExpandLazyAnd(w.ch, w.groups, w.si);
+      } else {
+        HB_CNT(kHbLazyOr);
+        ExpandLazy(w.ch, w.groups);
+        w.si.begin[2] = static_cast<int>(w.ch.size());
+        w.si.lazy = 0;
+      }
+      w.n = static_cast<int>(w.ch.size());
+      w.gmax->resize(w.groups);
+    }
+    const int b = w.si.begin[w.active], e = w.si.begin[w.active + 1];
+    std::vector<ChildKeyInfo>& keys = key_buf[ply];
+    keys.resize(e - b);
+    for (int i = b; i < e; ++i) {
+      ChildKeyInfo& k = keys[i - b];
+      ChildKey(w.ch[i], mode, k.board, k.hand, k.mode, k.full);
+      w.fulls[i] = k.full;
+      _mm_prefetch(reinterpret_cast<const char*>(GetCluster(NonZero(k.board))), _MM_HINT_T0);
+    }
+    for (int i = b; i < e; ++i) {
+      Child& c = w.ch[i];
+      const ChildKeyInfo& k = keys[i - b];
+      if (InPath(k.full)) {
+        c.pn = kInf; c.dn = 0; c.rep = 1;
+        continue;
+      }
+      const Probe p = Lookup(k.board, k.hand, k.mode, ChildPathKey(k.full));
+      c.pn = p.pn;
+      c.dn = p.dn;
+      if (!p.found && opt.deep_pn > 0) {
+        c.pn = 1 + static_cast<PnDn>(ply + 1) / static_cast<PnDn>(opt.deep_pn);
+      }
+      c.len = p.len;
+      c.rep = p.rep;
+      c.ph = p.ph;
+      if (!p.found && !c.pass && opt.eager_mate1 && pos.side_to_move() == def && ply + 1 < opt.max_ply) {
+        StateInfo est;
+        pos.do_move(c.move, est);
+        NodeResult mr;
+        Move mate = MOVE_NONE;
+        const bool m1 = !pos.in_check() && MateInOne(pos.hand_of(atk), mr, &mate);
+        pos.undo_move(c.move);
+        c.m1 = !m1;  
+        if (m1) {
+          ++nodes;
+          c.pn = 0; c.dn = kInf; c.len = mr.len; c.rep = 0; c.ph = mr.ph;
+          if (opt.store_mate1) Store(k.board, mr.ph, kModeMate, 0, kInf, mr.len, mate, false, 1);
+        }
+      }
+    }
+    if (opt.eager_sim && pos.side_to_move() == def && w.active >= (opt.eager_sim >= 2 ? 1 : 2)) {
+      for (int i = b; i < e; ++i) {
+        Child& c = w.ch[i];
+        if (c.pn != 0 && c.dn != 0 && !c.rep) TryReplay(w, c, mode);
+      }
+    }
+    for (int i = b; i < e; ++i) w.live->push_back(i);
+    ++w.active;
+    w.active_end = e;
+  }
+
+  bool TryReplay(NodeWork& w, Child& c, std::uint8_t mode) {
+    if (c.pass || c.sim) return false;
+    c.sim = 1;
+    int sidx = -1;
+    for (int i = 0; i < w.active_end; ++i) {
+      if (w.ch[i].pn != 0) continue;
+      if (w.ch[i].pass) { sidx = i; break; }
+      if (sidx < 0) sidx = i;
+    }
+    if (sidx < 0) return false;
+    const bool by_pass = w.ch[sidx].pass != 0;
+    HB_CNT(kHbSimTry);
+    const bool hit = TrySimulate(c, by_pass ? MOVE_NULL : w.ch[sidx].move, mode, by_pass ? kModeMate : mode);
+    if (hit) HB_CNT(kHbSimHit);
+    return hit;
+  }
+
+  void CloseNode(NodeWork& w, Key board, Hand hand, std::uint8_t mode, PnDn pn, PnDn dn) {
+    if (w.slot != nullptr) {
+      CacheSlot& slot = *w.slot;
+      CacheTag& tag = *w.tag;
+      if (pn == 0 || dn == 0 || w.n < opt.cache_min || w.n > kCacheMaxChildren) {
+        if (w.cached) tag.valid = 0;  
+      } else {
+        if (!w.cached) {
+          std::copy(w.ch.begin(), w.ch.end(), slot.ch);
+          std::copy(w.fulls, w.fulls + w.n, slot.full);
+          w.ch.p = slot.ch;
+          w.fulls = slot.full;
+        }
+        tag.valid = 1;
+        tag.board = board;
+        tag.hand = static_cast<std::uint32_t>(hand);
+        tag.mode = mode;
+        slot.n = static_cast<std::uint16_t>(w.n);
+        slot.groups = static_cast<std::uint16_t>(w.groups);
+        slot.active = static_cast<std::uint8_t>(w.active);
+        slot.active_end = static_cast<std::uint16_t>(w.active_end);
+        slot.si = w.si;
+      }
+      tag.in_use = 0;
+    }
+    w.ch.n = w.active_end;
+  }
+
+  NodeResult Conclude(const NodeWork& w, Key board, Hand hand, std::uint8_t mode, bool or_node, PnDn pn, PnDn dn,
+                      int best, std::uint64_t effort) {
+    const ChildList& ch = w.ch;
+    std::uint16_t len = 0;
+    Move best_move = MOVE_NONE;
+    bool rep = false;
+    Hand store_hand = hand;
+    if (pn == 0) {
+      if (or_node) {
+        int bl = 0x7fffffff;
+        Hand child_ph = hand;
+        for (const auto& c : ch)
+          if (c.pn == 0 && c.len < bl) { bl = c.len; best_move = c.move; child_ph = c.ph; }
+        len = static_cast<std::uint16_t>(std::min(65535, bl + 1));
+        store_hand = OrProofHand(child_ph, best_move, pos);
+      } else {
+        int ml = -1;
+        Hand uni = static_cast<Hand>(0);
+        for (const auto& c : ch) {
+          uni = HandUnion(uni, c.ph);
+          if (c.pass) continue;
+          if (static_cast<int>(c.len) > ml) { ml = c.len; best_move = c.move; }
+        }
+        len = static_cast<std::uint16_t>(std::min(65535, ml + 1));
+        store_hand = AndProofHand(uni, hand, pos.hand_of(def));
+      }
+    } else if (dn == 0) {
+      if (or_node) {
+        for (const auto& c : ch) rep |= c.rep != 0;
+      } else {
+        rep = true;
+        for (const auto& c : ch)
+          if (c.dn == 0 && !c.rep) { rep = false; best_move = c.move; break; }
+        if (rep)
+          for (const auto& c : ch)
+            if (c.dn == 0) { best_move = c.move; break; }
+      }
+    } else if (best >= 0) {
+      best_move = ch[best].move;
+    }
+    if (dn == 0 && !rep && Lookup(board, store_hand, mode).pn == 0) rep = true;
+    if (dn == 0 && rep && !hisshi_ply_limit) solver.RepInsert(RepKey(CurrentPathKey()));
+    Store(board, store_hand, mode, pn, dn, len, best_move, rep, effort);
+    return NodeResult{pn, dn, len, rep, store_hand};
+  }
+
+  int hisshi_ply_limit = 0;
+
+  NodeResult Search(int ply, std::uint8_t mode, PnDn thpn, PnDn thdn, Move last) {
+    if (hisshi_ply_limit && mode == kModeHisshi && ply >= hisshi_ply_limit && pos.side_to_move() == atk) {
+      NodeResult r = SearchBody(ply, kModeMate, thpn, thdn, last);
+      if (r.dn == 0) r.rep = true;
+      return r;
+    }
+    return SearchBody(ply, mode, thpn, thdn, last);
+  }
+
+  NodeResult SearchBody(int ply, std::uint8_t mode, PnDn thpn, PnDn thdn, Move last) {
+    ++nodes;
+    if (ply > seldepth) seldepth = ply;
+    if (nodes >= next_check) CheckLimits();
+    const bool or_node = pos.side_to_move() == atk;
+    const Key board = BoardKey(pos);
+    const Hand hand = pos.hand_of(atk);
+    const std::uint64_t nodes_at_start = nodes;
+    const bool m1_tested = skip_m1;
+    skip_m1 = false;
+    HB_CNT(mode == kModeMate ? (or_node ? kHbMateOr : kHbMateAnd) : (or_node ? kHbHisOr : kHbHisAnd));
+
+    if (ply >= opt.max_ply) return NodeResult{kInf, 0, 0, true, hand};
+
+    Probe self = Lookup(board, hand, mode, CurrentPathKey());
+    if (rederive_root && ply == rederive_ply && self.dn == 0) {
+      self.pn = 1;
+      self.dn = 1;
+      self.rep = false;
+    }
+    if (self.pn == 0 || self.dn == 0 || self.pn >= thpn || self.dn >= thdn) {
+      ++stat_tt_return;
+      HB_CNT(mode == kModeMate ? kHbTTRetMate : kHbTTRetHis);
+      return NodeResult{self.pn, self.dn, self.len, self.rep, self.pn == 0 ? self.ph : hand};
+    }
+    if (!self.found) ++stat_new;
+
+    NodeResult mated;
+    if (or_node && !self.found && !m1_tested && !pos.in_check() && MateInOne(hand, mated)) { HB_CNT(kHbMate1); return mated; }
+
+    NodeWork w;
+    w.gmax = &gmax_buf[ply];
+    w.live = &live_buf[ply];
+    OpenNode(w, board, hand, mode, or_node, last, ply);
+    if (w.n == 0 && !w.si.lazy) {
+      if (or_node) {
+        Store(board, hand, mode, kInf, 0, 0, MOVE_NONE, false, 1);
+        return NodeResult{kInf, 0, 0, false, hand};
+      }
+      const Hand ph = AndProofHand(static_cast<Hand>(0), hand, pos.hand_of(def));
+      Store(board, ph, mode, 0, kInf, 0, MOVE_NONE, false, 1);
+      return NodeResult{0, kInf, 0, false, ph};
+    }
+
+    std::vector<PnDn>& gmax = *w.gmax;
+    std::vector<int>& live = *w.live;
+    ChildList& ch = w.ch;
+    StageInfo& si = w.si;
+    gmax.assign(w.groups, 0);
+    live.clear();
+    if (w.cached) {
+      for (int i = 0; i < w.active_end; ++i) live.push_back(i);
+    } else {
+      Activate(w, mode, ply);
+    }
+
+    PnDn pn = 1, dn = 1;
+    int best = 0;
+    for (;;) {
+      std::fill(gmax.begin(), gmax.end(), 0);
+      PnDn inactive_pn = 0, inactive_dn = 0;
+      for (int st = w.active; st < si.nstages; ++st) {
+        inactive_pn = Add(inactive_pn, si.est_pn[st]);
+        inactive_dn = Add(inactive_dn, si.est_dn[st]);
+      }
+      PnDn best_v = kInf + 1, second_v = kInf + 1;
+      best = -1;
+      if (or_node) {
+        for (std::size_t k = 0; k < live.size();) {
+          const int i = live[k];
+          const Child& c = ch[i];
+          if (c.dn == 0) {  
+            live[k] = live.back();
+            live.pop_back();
+            continue;
+          }
+          ++k;
+          const PnDn v = c.pn == 0 ? 0 : Add(c.pn, c.cost);
+          if (v < best_v || (v == best_v && Tie(ch, i) < Tie(ch, best))) { second_v = best_v; best_v = v; best = i; }
+          else if (v < second_v) second_v = v;
+          gmax[c.group] = std::max(gmax[c.group], c.dn);
+        }
+        const PnDn virt = w.active < si.nstages ? si.est_pn[w.active] : kInf + 1;
+        pn = std::min(best_v, virt);
+        if (pn > kInf) pn = kInf;
+        dn = inactive_dn;
+        for (int g = 0; g < w.groups; ++g) dn = Add(dn, gmax[g]);
+        if (pn == 0) dn = kInf;
+        if (ply == 0) {
+          live_root_pn = pn;
+          live_root_dn = dn;
+          live_root_best = best >= 0 && !ch[best].pass ? ch[best].move : MOVE_NONE;
+        }
+        if (pn >= thpn || dn >= thdn || stop) break;
+        if (virt < best_v) { Activate(w, mode, ply); continue; }
+        second_v = std::min(second_v, virt);
+        Child& c = ch[best];
+        const PnDn sec = second_v > kInf ? kInf : second_v;
+        PnDn cthpn = std::min(thpn, NextThreshold(Epsilon(sec, mode)));
+        cthpn = cthpn >= kInf ? kInf : cthpn - c.cost;
+        const PnDn cthdn = thdn >= kInf ? kInf : thdn - (dn - gmax[c.group]);
+        if (ply == 0 && report) {
+          live_rest_pn = sec;
+          live_rest_dn = dn >= kInf ? kInf : dn - gmax[c.group];
+          live_group_dn = 0;
+          for (const int i : live)
+            if (i != best && ch[i].group == c.group) live_group_dn = std::max(live_group_dn, ch[i].dn);
+          live_child_cost = c.cost;
+          live_child_pn = c.pn;
+          live_child_dn = c.dn;
+          live_in_child = true;
+        }
+        SearchChild(ply, mode, c, cthpn, cthdn);
+        if (ply == 0) live_in_child = false;
+        if (c.pn == 0) killers[ply] = c.move;
+      } else {
+        for (std::size_t k = 0; k < live.size();) {
+          const int i = live[k];
+          const Child& c = ch[i];
+          if (c.pn == 0) {  
+            live[k] = live.back();
+            live.pop_back();
+            continue;
+          }
+          ++k;
+          const PnDn v = c.dn;
+          if (v < best_v || (v == best_v && Tie(ch, i) < Tie(ch, best))) { second_v = best_v; best_v = v; best = i; }
+          else if (v < second_v) second_v = v;
+          gmax[c.group] = std::max(gmax[c.group], c.pn);
+        }
+        PnDn active_pn = 0;
+        for (int g = 0; g < w.groups; ++g) active_pn = Add(active_pn, gmax[g]);
+        if (active_pn == 0 && w.active < si.nstages) { Activate(w, mode, ply); continue; }
+        const PnDn virt = w.active < si.nstages ? si.est_dn[w.active] : kInf + 1;
+        dn = std::min(best_v, virt);
+        if (dn > kInf) dn = kInf;
+        pn = Add(active_pn, inactive_pn);
+        if (dn == 0) pn = kInf;
+        if (ply == 1 && live_in_child) {
+          live_child_pn = pn;  
+          live_child_dn = dn;
+        }
+        if (pn >= thpn || dn >= thdn || stop) break;
+        if (virt < best_v) { Activate(w, mode, ply); continue; }
+        second_v = std::min(second_v, virt);
+        Child& c = ch[best];
+        if (TryReplay(w, c, mode)) continue;
+        const PnDn sec = second_v > kInf ? kInf : second_v;
+        const PnDn cthdn = std::min(thdn, NextThreshold(Epsilon(sec, mode)));
+        const PnDn cthpn = thpn >= kInf ? kInf : thpn - (pn - gmax[c.group]);
+        SearchChild(ply, mode, c, cthpn, cthdn);
+      }
+    }
+    CloseNode(w, board, hand, mode, pn, dn);
+    return Conclude(w, board, hand, mode, or_node, pn, dn, best, nodes - nodes_at_start + 1);
+  }
+
+  void SearchChild(int ply, std::uint8_t mode, Child& c, PnDn thpn, PnDn thdn) {
+    StateInfo& st = states[ply];
+    std::uint8_t cmode = mode;
+    const Move m = c.move;
+    _mm_prefetch(reinterpret_cast<const char*>(GetCluster(NonZero(c.pass ? (BoardKey(pos) ^ side_key) : pos.board_key_after(m)))),
+                 _MM_HINT_T0);
+    if (c.pass) {
+      pos.do_null_move(st);
+      cmode = kModeMate;
+    } else {
+      pos.do_move(m, st);
+    }
+    PushPath(PathEntry(pos.key(), cmode));
+    skip_m1 = c.m1 != 0;
+    const NodeResult r = Search(ply + 1, cmode, thpn, thdn, c.pass ? MOVE_NONE : m);
+    PopPath();
+    if (c.pass) pos.undo_null_move();
+    else pos.undo_move(m);
+    c.pn = r.pn;
+    c.dn = r.dn;
+    c.len = r.len;
+    c.rep = r.rep;
+    c.ph = r.ph;
+  }
+
+  static constexpr int kSimMaxDepth = 256;
+  const std::uint64_t kSimBudget = static_cast<std::uint64_t>(opt.sim_budget);
+  Position shadow;
+  std::vector<StateInfo> sim_states = std::vector<StateInfo>(kSimMaxDepth + 4);
+  std::vector<StateInfo> shadow_states = std::vector<StateInfo>(kSimMaxDepth + 4);
+  std::uint64_t sim_budget = 0;
+  std::uint64_t sim_nodes = 0;  
+
+  bool SimLeaf(std::uint8_t mode, std::uint16_t& len, bool& pure) {
+    const Key board = BoardKey(pos);
+    const Hand hand = pos.hand_of(atk);
+    const Probe pm = Lookup(board, hand, kModeMate);
+    if (pm.pn == 0) { len = pm.len; return true; }
+    if (mode != kModeMate) {
+      const Probe p = Lookup(board, hand, mode);
+      if (p.pn == 0) { len = p.len; pure = false; return true; }
+    }
+    return false;
+  }
+
+  bool SimOr(int d, std::uint8_t mode, std::uint8_t smode, std::uint16_t& len, bool& pure) {
+    if (sim_budget == 0 || d >= kSimMaxDepth) return false;
+    const std::uint64_t sim_nodes0 = sim_nodes;
+    --sim_budget;
+    ++sim_nodes;
+    ++nodes;
+    const Key board = BoardKey(pos);
+    const Hand hand = pos.hand_of(atk);
+    if (SimLeaf(mode, len, pure)) return true;
+    if (!pos.in_check()) {
+      const Move mate = Mate::mate_1ply(pos);
+      if (mate != MOVE_NONE) {
+        len = 1;
+        return true;
+      }
+    }
+    const Probe sp = Lookup(BoardKey(shadow), shadow.hand_of(atk), smode);
+    if (sp.pn != 0 || sp.best == 0) return false;
+    const Move sm = shadow.to_move(Move16(sp.best));
+    if (sm == MOVE_NONE || !shadow.pseudo_legal_s<true>(sm) || !shadow.legal(sm)) return false;
+    const Move m = pos.to_move(Move16(sp.best));
+    if (m == MOVE_NONE || !pos.pseudo_legal_s<true>(m) || !pos.legal(m) || !pos.gives_check(m)) return false;
+    pos.do_move(m, sim_states[d]);
+    shadow.do_move(sm, shadow_states[d]);
+    std::uint16_t clen = 0;
+    bool cpure = true;
+    const bool ok = SimAnd(d + 1, mode, smode, clen, cpure);
+    shadow.undo_move(sm);
+    pos.undo_move(m);
+    if (!ok) return false;
+    pure = pure && cpure;
+    len = static_cast<std::uint16_t>(std::min(65535, clen + 1));
+    Store(board, hand, cpure ? kModeMate : mode, 0, kInf, len, m, false, sim_nodes - sim_nodes0 + 1);
+    return true;
+  }
+
+  bool SimAnd(int d, std::uint8_t mode, std::uint8_t smode, std::uint16_t& len, bool& pure) {
+    if (sim_budget == 0 || d >= kSimMaxDepth) return false;
+    const std::uint64_t sim_nodes0 = sim_nodes;
+    --sim_budget;
+    ++sim_nodes;
+    ++nodes;
+    const Key board = BoardKey(pos);
+    const Hand hand = pos.hand_of(atk);
+    int maxlen = -1;
+    bool all_pure = true;
+    std::pair<Move, Move> mapped_moves[kMaxChildren];
+    int nmapped = 0;
+    for (const auto& em : MoveList<EVASIONS_ALL>(pos)) {
+      const Move e = em.move;
+      if (!pos.legal(e)) continue;
+      const Move se = shadow.to_move(Move16(e));
+      if (se != MOVE_NONE && shadow.pseudo_legal_s<true>(se) && shadow.legal(se)) {
+        mapped_moves[nmapped++] = {e, se};
+        continue;
+      }
+      std::uint16_t clen = 0;
+      pos.do_move(e, sim_states[d]);
+      const bool ok = SimLeaf(mode, clen, all_pure);
+      pos.undo_move(e);
+      if (!ok) return false;
+      maxlen = std::max<int>(maxlen, clen);
+    }
+    for (int i = 0; i < nmapped; ++i) {
+      const auto [e, se] = mapped_moves[i];
+      std::uint16_t clen = 0;
+      pos.do_move(e, sim_states[d]);
+      shadow.do_move(se, shadow_states[d]);
+      const bool ok = SimOr(d + 1, mode, smode, clen, all_pure);
+      shadow.undo_move(se);
+      pos.undo_move(e);
+      if (!ok) return false;
+      maxlen = std::max<int>(maxlen, clen);
+    }
+    pure = pure && all_pure;
+    len = static_cast<std::uint16_t>(std::min(65535, maxlen + 1));
+    Store(board, hand, all_pure ? kModeMate : mode, 0, kInf, len, MOVE_NONE, false, sim_nodes - sim_nodes0 + 1);
+    return true;
+  }
+
+  StateInfo shadow_root_st, shadow_move_st;
+  Key shadow_base = 0;  
+
+  bool TrySimulate(Child& c, Move shadow_move, std::uint8_t mode, std::uint8_t smode) {
+    {
+      const Key sboard = shadow_move == MOVE_NULL ? (BoardKey(pos) ^ side_key) : pos.board_key_after(shadow_move);
+      const Probe sp = Lookup(sboard, pos.hand_of(atk), smode);
+      if (sp.pn != 0 || sp.best == 0) return false;
+      StateInfo sr;
+      pos.do_move(c.move, sr);
+      const Move m = pos.to_move(Move16(sp.best));
+      const bool first_ok = m != MOVE_NONE && pos.pseudo_legal_s<true>(m) && pos.legal(m) && pos.gives_check(m);
+      pos.undo_move(c.move);
+      if (!first_ok) return false;
+    }
+    const Key base = pos.key() ^ (static_cast<Key>(shadow_move) * 0x9E3779B97F4A7C15ULL);
+    if (base != shadow_base) {
+      shadow.set(pos.sfen(), &shadow_root_st, pos.this_thread());
+      if (shadow_move == MOVE_NULL) shadow.do_null_move(shadow_move_st);
+      else shadow.do_move(shadow_move, shadow_move_st);
+      shadow_base = base;
+    }
+    StateInfo sr;
+    pos.do_move(c.move, sr);
+    sim_budget = kSimBudget;
+    std::uint16_t len = 0;
+    bool pure = true;
+    const bool ok = SimOr(0, mode, smode, len, pure);
+    pos.undo_move(c.move);
+    if (ok) {
+      c.pn = 0;
+      c.dn = kInf;
+      c.len = len;
+      c.rep = 0;
+      c.ph = pos.hand_of(atk);
+    }
+    return ok;
+  }
+
+  NodeResult Run(std::uint8_t mode) {
+    PushPath(PathEntry(pos.key(), mode));
+    NodeResult r{1, 1, 0, false, static_cast<Hand>(0)};
+    while (!stop) {
+      r = Search(0, mode, kInf, kInf, MOVE_NONE);
+      if (r.pn == 0 || r.dn == 0) break;
+      if (r.pn >= kInf || r.dn >= kInf) break;  
+    }
+    PopPath();
+    return r;
+  }
+
+  Probe ProbeChild(const Child& c, std::uint8_t mode) {
+    Key cb, cf;
+    Hand chand;
+    std::uint8_t cm;
+    ChildKey(c, mode, cb, chand, cm, cf);
+    return Lookup(cb, chand, cm);
+  }
+
+  NodeResult SubSearch(std::uint8_t mode, std::uint64_t budget) {
+    NodeResult r{1, 1, 0, false, static_cast<Hand>(0)};
+    const bool saved_stop = stop;
+    stop = false;
+    node_cap = nodes + budget;
+    next_check = nodes;  
+    PushPath(PathEntry(pos.key(), mode));
+    while (!stop) {
+      r = Search(static_cast<int>(path.size()), mode, kInf, kInf, MOVE_NONE);
+      if (r.pn == 0 || r.dn == 0) break;
+    }
+    PopPath();
+    node_cap = 0;
+    stop = saved_stop;
+    return r;
+  }
+
+  bool ShortSearch(int d, std::uint64_t budget) {
+    hisshi_ply_limit = static_cast<int>(path.size()) + 1 + d + 1;
+    const NodeResult r = SubSearch(kModeHisshi, budget);
+    hisshi_ply_limit = 0;
+    return r.pn == 0;
+  }
+};
+
+}  
+}  
+
+#endif  

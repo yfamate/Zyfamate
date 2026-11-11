@@ -1,0 +1,3 @@
+hisshi: modified version of Suisho-BM v1.2.2 by tayayan (https://github.com/tayayan/Suisho-BM), GPL-3.0 (LICENSE).
+Modified by yfamate, 2026-11: transposition table cleared by dirty cluster and children cache kept across solves; mate-in-one proofs at defender stage activation; cluster index by multiply-shift, children-cache tag array, child cluster prefetch; tuned defaults (Threads 1 epsilon 25, check stage dn 32, lazy pn 0); Makefile ZEN5 target and PGO switches. Comments removed.
+Build: cd source && make TARGET_CPU=AVX2 (COMPILER=clang++ for PGO_GEN / PGO_USE).
