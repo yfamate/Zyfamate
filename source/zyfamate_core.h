@@ -37,6 +37,7 @@ static inline _CMul _zmalloc(size_t s){ return {s}; }
 static inline _CCal _zcalloc(size_t n,size_t s){ return {n,s}; }
 #define malloc(s) Zyfamate::_zmalloc(s)
 #define calloc(n,s) Zyfamate::_zcalloc(n,s)
+// Credit: df-pn: A. Nagai, "Df-pn Algorithm for Searching AND/OR Trees and Its Applications", PhD thesis, University of Tokyo, 2002.
 
 
 
@@ -99,6 +100,7 @@ static void build_attack_tables(void);
 
 
 static uint64_t Z_PIECE[31][81], Z_HAND[2][8][40], Z_SIDE;
+// Credit: splitmix64 (Sebastiano Vigna, public domain).
 static uint64_t sm_state;
 static uint64_t sm_next(){ uint64_t z=(sm_state+=0x9E3779B97F4A7C15ULL);
   z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL; z=(z^(z>>27))*0x94D049BB133111EBULL; return z^(z>>31);}
@@ -192,7 +194,7 @@ static int parse_sfen(Pos*p,const char*sfen){
     int col=(ch>='A'&&ch<='Z')?BLACK:WHITE;
     char up=(ch>='a'&&ch<='z')?ch-32:ch;
     int t=char_type(up); if(!t)return 0;
-    if(promo){t=PROMO[t];promo=0;}
+    if(promo){t=PROMO[t];promo=0; if(!t)return 0;}   
     if(r<0||r>8||c<0||c>8)return 0;
     p->b[SQ(r,c)]=mkpc(t,col); c++;
   }
@@ -524,6 +526,7 @@ static inline void tt_prefetch(uint64_t k){ __builtin_prefetch(&tt_key[k&TTMASK]
   __builtin_prefetch(&tt_rec[k&TTMASK]); }
 static inline void tt_clear_gen(){ for(size_t i=0;i<TTSIZE;i++) tt_rec[i].gen=0; }
 
+// Credit: proof retention after KeepOnlyProofs of Suisho-BM (tayayan, 401452eb82).
 
 #define PROOF_GEN 0xFFFFFFFFu
 static int g_keep_proofs=0; static std::atomic<long> g_proof_hits{0};
@@ -545,6 +548,7 @@ static void tt_store(uint64_t k,int pn,int dn){ if(g_keep_proofs){ tt_store_keep
   tt_rec[slot].gen=g_gen;tt_key[slot]=k;tt_rec[slot].pn=pn;tt_rec[slot].dn=dn;}
 
 static unsigned g_order_variant=0; 
+// Credit: proof and disproof pieces: M. Seo, 「詰将棋を解くアルゴリズムにおける優越関係の効率的な利用について」, Game Programming Workshop 1999.
 
 #define STPROBE 16
 
@@ -586,6 +590,7 @@ static volatile int g_usi_mode=0; static double g_usi_last_info=0;
 static __thread uint64_t g_path[4096]; static __thread int g_pathlen;
 static int on_path(uint64_t k){for(int i=0;i<g_pathlen;i++)if(g_path[i]==k)return 1;return 0;}
 
+// Credit: A. Kishimoto, M. Müller, "A General Solution to the Graph History Interaction Problem", AAAI 2004.
 
 
 
@@ -845,6 +850,7 @@ static int is_mated(Pos*p){
   return 1;
 }
 static int use_plus=1;
+// Credit: 1+ε threshold: J. Pawlewicz, Ł. Lew, "Improving Depth-First PN-Search: 1 + ε Trick", Computers and Games 2006.
 static int g_eps=16;  
 
 static int g_order=0;
@@ -942,6 +948,10 @@ static void m3_add(uint64_t k){ int i=k&M3MASK,slot=-1,fr=-1; for(int j=0;j<6;j+
 
 #define ZYF_MAX_DEPTH 3900
 
+static int zyf_thread_create(pthread_t*t,void*(*fn)(void*),void*arg){
+  pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,(size_t)128<<20);
+  const int r=pthread_create(t,&at,fn,arg); pthread_attr_destroy(&at); return r; }
+
 static __thread std::vector<std::pair<uint64_t,uint16_t>>* g_yexport=nullptr; static __thread size_t g_yexport_cap=0;
 
 static __thread void (*g_ylive)(uint64_t,uint16_t)=nullptr;
@@ -977,6 +987,7 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
     if(use_plus && tt_find(ck[i])<0 && twin_find(ck[i])<0){ make_move(p,moves[i]); assert(ck[i]==p->key);
       int ep,ed;estimate_mv(p,moves[i],&ep,&ed);tt_store(p->key,ep,ed); unmake_move(p); } }
 
+  // Credit: delayed expansion of interposed drops after KomoringHeights (komori-n).
   uint8_t dly[MAXMOVES]; int gnx[MAXMOVES];                 
   for(int i=0;i<nm;i++){ dly[i]=0; gnx[i]=-1; }
   if(!is_or && !g_nodelay){                          
@@ -1037,6 +1048,7 @@ static int mid(Pos*p,int thpn,int thdn,uint64_t*rtout){
   }
 }
 
+// Credit: T. Kaneko, "Parallel Depth First Proof Number Search", AAAI 2010.
 
 static pthread_mutex_t g_mtx=PTHREAD_MUTEX_INITIALIZER;
 static void ttp_read(uint64_t k,int*pn,int*dn){ pthread_mutex_lock(&g_mtx); tt_read(k,pn,dn); pthread_mutex_unlock(&g_mtx); }
@@ -1137,7 +1149,7 @@ static int solve_parallel(const char*sfen,int nthreads,long nl,double tl,long*no
   if(++g_gen==0 || g_gen==PROOF_GEN){ tt_clear_gen(); g_gen=1; }
   if(nthreads<1)nthreads=1; if(nthreads>64)nthreads=64;
   pthread_t th[64]; PArg a[64];
-  for(int t=0;t<nthreads;t++){ a[t].sfen=sfen; a[t].nodes=0; pthread_create(&th[t],NULL,pworker,&a[t]); }
+  for(int t=0;t<nthreads;t++){ a[t].sfen=sfen; a[t].nodes=0; zyf_thread_create(&th[t],pworker,&a[t]); }
   long tot=0; for(int t=0;t<nthreads;t++){ pthread_join(th[t],NULL); tot+=a[t].nodes; }
   g_parallel=0; use_superior=save_sup; if(nodes_out)*nodes_out=tot;
   int pn,dn; tt_read(p.key,&pn,&dn); return pn==0?1:(dn==0?0:2); }
@@ -1161,29 +1173,30 @@ static void lm_put(uint64_t h,int v){int i=h&LMMASK;int slot=-1;for(int j=0;j<6;
 static int mate_len_tt(Pos*p,int cap){
   CYF_ZYF_TEST_STAGE(2);
   
-  if(g_stop || (lm_deadline>0 && now()>=lm_deadline)) return -1;
-  if(cap<0) return -1;
+  if(g_stop || (lm_deadline>0 && now()>=lm_deadline)) return -2;
+  if(cap<0) return -2;
   
   uint64_t h=p->key ^ 0xD6E8FEB86659FD93ULL;
-  int v; if(lm_get(h,&v)) return v==PW_UNKNOWN?-1:v;
-  int is_or=(p->side==g_attacker); int res;
+  
+  int v; if(lm_get(h,&v)){ if(v==PW_UNKNOWN) return -1; if(v<100) return v; if(cap<=v-100) return -2; }
+  int is_or=(p->side==g_attacker); int res; int cut=0;
   if(!is_or){
     int mv[MAXMOVES]; int n=gen_legal(p,mv);
     if(n==0){ lm_put(h,0); return 0; }              
-    if(cap==0) return -1;   
+    if(cap==0){ lm_put(h,100); return -2; }   
     int worst=-1;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int pn,dn; tt_read(p->key,&pn,&dn);
       int r=(pn==0)?mate_len_tt(p,cap-1):-1; unmake_move(p);
-      if(r<0){ lm_put(h,PW_UNKNOWN); return -1; }   
+      if(r<0){ lm_put(h,r==-2?100+cap:PW_UNKNOWN); return r; }   
       if(r>worst)worst=r; }                          
     res=1+worst;
   } else {
-    if(cap==0) return -1;   
+    if(cap==0){ lm_put(h,100); return -2; }   
     int mv[MAXMOVES]; int n=gen_checks(p,mv); res=-1;
     for(int i=0;i<n;i++){ make_move(p,mv[i]); int pn,dn; tt_read(p->key,&pn,&dn);
       int r=(pn==0)?mate_len_tt(p,cap-1):-1; unmake_move(p);
-      if(r>=0){ res=1+r; break; } }                  
-    if(res<0){ lm_put(h,PW_UNKNOWN); return -1; }
+      if(r>=0){ res=1+r; break; } if(r==-2) cut=1; }   
+    if(res<0){ lm_put(h,cut?100+cap:PW_UNKNOWN); return cut?-2:-1; }
   }
   if(res>=0 && res<PW_UNKNOWN) lm_put(h,res);
   return res;
@@ -1551,7 +1564,8 @@ static void usi_loop(void){
         s+=5;
         char sfen_buf[1024]; int si=0;
         int fields=0;
-        while(*s && fields<4){ if(*s==' '){ fields++; if(fields<4){sfen_buf[si++]=*s++;continue;} else break; }
+        
+        while(*s && fields<4 && si<(int)sizeof sfen_buf-1){ if(*s==' '){ fields++; if(fields<4){sfen_buf[si++]=*s++;continue;} else break; }
           sfen_buf[si++]=*s++; }
         sfen_buf[si]=0;
         if(!parse_sfen(&g_usi_pos,sfen_buf)){ g_usi_has_pos=0; continue; }
@@ -1589,7 +1603,7 @@ static void usi_loop(void){
         if(*mp>='0'&&*mp<='9'){ double ms=atof(mp); if(ms>0) g_usi_tlimit=ms/1000.0; } }
       g_stop=0; g_usi_searching=1; g_usi_done=0;
       usp=0; g_pathlen=0;
-      pthread_create(&g_usi_thread,NULL,usi_solver,NULL);
+      zyf_thread_create(&g_usi_thread,usi_solver,NULL);
       continue; }
 
     if(!strcmp(line,"stop")){
