@@ -526,7 +526,7 @@ static inline void tt_prefetch(uint64_t k){ __builtin_prefetch(&tt_key[k&TTMASK]
   __builtin_prefetch(&tt_rec[k&TTMASK]); }
 static inline void tt_clear_gen(){ for(size_t i=0;i<TTSIZE;i++) tt_rec[i].gen=0; }
 
-// Credit: proof retention after KeepOnlyProofs of Suisho-BM (tayayan, 401452eb82).
+// Credit: proof retention after KeepOnlyProofs of Suisho-BM (tayayan, read at 401452eb82).
 
 #define PROOF_GEN 0xFFFFFFFFu
 static int g_keep_proofs=0; static std::atomic<long> g_proof_hits{0};
@@ -586,6 +586,7 @@ static __thread int g_stop_reason=0;
 
 static __thread unsigned g_poll_mask=8191;
 static std::atomic<int> g_stop{0}; static int g_parallel=0;
+static std::atomic<int> g_usi_user_stop{0}; static std::atomic<int> g_usi_pv_live{0};   
 static volatile int g_usi_mode=0; static double g_usi_last_info=0;
 static __thread uint64_t g_path[4096]; static __thread int g_pathlen;
 static int on_path(uint64_t k){for(int i=0;i<g_pathlen;i++)if(g_path[i]==k)return 1;return 0;}
@@ -1232,7 +1233,8 @@ static int can_mate(Pos*p,int rem,int*rep_out){
   *rep_out=0;
   
   if((++lm_nodes & 16383)==0){
-    if((lm_honor_stop&&g_stop)||lm_nodes>lm_limit||(lm_deadline>0&&now()>lm_deadline)) longjmp(lm_jmp,1); }
+    if((lm_honor_stop&&g_stop)||lm_nodes>lm_limit||(lm_deadline>0&&now()>lm_deadline)
+       ||(g_usi_pv_live.load(std::memory_order_relaxed)&&g_usi_user_stop.load(std::memory_order_relaxed))) longjmp(lm_jmp,1); }
   uint64_t h=p->key ^ (0x9E3779B97F4A7C15ULL*(uint64_t)(rem+1));
   int v; if(lm_get(h,&v))return v;              
   int is_or=(p->side==g_attacker); int res, subrep=0;
@@ -1470,7 +1472,8 @@ static void print_pv_usi(Pos*p,int D,char*out,double budget_s){
   lm_init(); lm_nodes=0; lm_limit=200000000; lm_honor_stop=0;
   lm_deadline = budget_s>0 ? now()+budget_s : 0;
   int savedp=g_pathlen;
-  if(setjmp(lm_jmp)){ g_pathlen=savedp; return; }
+  if(setjmp(lm_jmp)){ g_pathlen=savedp; g_usi_pv_live=0; return; }
+  g_usi_pv_live=1;
   while(cur>0 && guard++<2000){ int best=-1,bd;
     if(p->side==g_attacker){ int mv[MAXMOVES];int n=gen_checks(p,mv); bd=INF;
       for(int i=0;i<n;i++){make_move(p,mv[i]);int d=node_dist(p,cur-1);unmake_move(p);if(d<bd){bd=d;best=i;}}
@@ -1480,20 +1483,42 @@ static void print_pv_usi(Pos*p,int D,char*out,double budget_s){
       if(best<0)break; move_usi(mv[best],mb); if(out[0])strcat(out," "); strcat(out,mb); make_move(p,mv[best]); cur=bd;
     }
   }
-  g_pathlen=savedp;
+  g_pathlen=savedp; g_usi_pv_live=0;
 }
+
+
+
+static int print_pv_tt(Pos*p,int first,char*out){
+  char mb[8]; int n=0, m=first; uint64_t seen[640]; out[0]=0;
+  while(m>=0 && n<600){
+    move_usi(m,mb); if(n)strcat(out," "); strcat(out,mb); make_move(p,m); n++;
+    int rp[MAXMOVES]; int k=gen_legal(p,rp); if(k==0) break;
+    int rep=-1,nxt=-1;
+    for(int i=0;i<k && rep<0;i++){ make_move(p,rp[i]); int dup=0; for(int j=0;j<n/2 && !dup;j++) dup=(seen[j]==p->key);
+      int f=dup?-1:first_mate_move(p); unmake_move(p); if(f>=0){ rep=rp[i]; nxt=f; } }
+    if(rep<0) break;
+    move_usi(rep,mb); strcat(out," "); strcat(out,mb); make_move(p,rep); n++; seen[n/2-1]=p->key; m=nxt;
+  }
+  return n;
+}
+
+static double g_usi_deadline=0;   
+static double usi_post_budget(void){ double b=5.0; if(g_usi_deadline>0){ double r=g_usi_deadline-now(); if(r<b)b=r; }
+  if(g_usi_user_stop.load()) b=0.05; return b<0.05?0.05:b; }
 
 static void usi_emit_checkmate(void){
   if(g_usi_result.result==1 && g_usi_result.bestmove>=0){
     int L=g_usi_result.mate_len;
     if(L>0){ char pv[8192]; Pos q=g_usi_pos; g_attacker=q.side;
-      print_pv_usi(&q,L,pv,5.0);
+      print_pv_usi(&q,L,pv,usi_post_budget());
       
       char fmb[8]; move_usi(g_usi_result.bestmove,fmb); size_t fl=strlen(fmb);
       if(pv[0] && (strncmp(pv,fmb,fl)!=0 || (pv[fl]!=' ' && pv[fl]!=0))) strcpy(pv,fmb);
+      { int n=0; if(pv[0]){ n=1; for(char*c=pv;*c;c++) if(*c==' ') n++; }
+        if(n<L){ char pv2[8192]; Pos q2=g_usi_pos; g_attacker=q2.side; if(print_pv_tt(&q2,g_usi_result.bestmove,pv2)>n) strcpy(pv,pv2); } }
       if(pv[0]) printf("checkmate %s\n",pv);
       else { char mb[8]; move_usi(g_usi_result.bestmove,mb); printf("checkmate %s\n",mb); }
-    } else { char mb[8]; move_usi(g_usi_result.bestmove,mb); printf("checkmate %s\n",mb); }
+    } else { char pv2[8192]; Pos q2=g_usi_pos; g_attacker=q2.side; print_pv_tt(&q2,g_usi_result.bestmove,pv2); printf("checkmate %s\n",pv2); }
   } else if(g_usi_result.result==0){
     printf("checkmate nomate\n");
   } else {
@@ -1512,7 +1537,7 @@ static void* usi_solver(void*arg){
   g_usi_result.nodes=nodes;
   if(g_usi_result.result==1){
     Pos q=g_usi_pos; g_attacker=q.side;
-    g_usi_result.mate_len=mate_len_fast(&q,399,5.0);
+    g_usi_result.mate_len=mate_len_fast(&q,399,usi_post_budget());
     Pos q2=g_usi_pos; g_attacker=q2.side;
     g_usi_result.bestmove=first_mate_move(&q2);
   } else { g_usi_result.mate_len=-1; g_usi_result.bestmove=-1; }
@@ -1601,12 +1626,13 @@ static void usi_loop(void){
       g_usi_tlimit=1e9;
       if(g_usi_gomate){ const char*mp=strstr(line,"mate")+4; while(*mp==' ')mp++;
         if(*mp>='0'&&*mp<='9'){ double ms=atof(mp); if(ms>0) g_usi_tlimit=ms/1000.0; } }
+      g_usi_user_stop=0; g_usi_deadline=(g_usi_gomate && g_usi_tlimit<1e8)?now()+g_usi_tlimit:0;
       g_stop=0; g_usi_searching=1; g_usi_done=0;
       usp=0; g_pathlen=0;
       zyf_thread_create(&g_usi_thread,usi_solver,NULL);
       continue; }
 
-    if(!strcmp(line,"stop")){
+    if(!strcmp(line,"stop")){ g_usi_user_stop=1;
       if(g_usi_searching){ g_stop=1; pthread_join(g_usi_thread,NULL); g_usi_searching=0; }
       if(g_usi_gomate){
         if(!g_usi_done) usi_emit_checkmate();
